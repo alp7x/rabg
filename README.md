@@ -5,15 +5,15 @@ Shows your beaten games alongside mastered games in the Game Awards section of R
 
 ***
 
-<img src="https://raw.githubusercontent.com/sakci/rabg/main/Screenshot 1.png">
+<img src="https://raw.githubusercontent.com/alp7x/rabg/main/Screenshot 1.png">
 
 ***
 
-<img src="https://raw.githubusercontent.com/sakci/rabg/main/Screenshot 2.png">
+<img src="https://raw.githubusercontent.com/alp7x/rabg/main/Screenshot 2.png">
 
 ***
 
-<img src="https://raw.githubusercontent.com/sakci/rabg/main/Screenshot 3.png">
+<img src="https://raw.githubusercontent.com/alp7x/rabg/main/Screenshot 3.png">
 
 ***
 
