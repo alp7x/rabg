@@ -83,6 +83,20 @@
 /* Hidden file input used by the Import button. */
 .ra-import-input { display: none; }
 
+/* Status texts: "Loading… 100/208" next to the Beaten label, the sync status
+   in the footer, and the Export/Import result message. */
+#gameawards .ra-loading {
+  font-size: 0.75rem;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+.ra-sync-status,
+.ra-backup-msg {
+  font-size: 0.75rem;
+  opacity: 0.8;
+}
+.ra-sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ---- Footer slider rows ---- */
 /* Custom-drawn so Firefox and Chromium render IDENTICALLY: a 20px thumb
    (gray filling + white ring on Dark/Black; inverted — white filling +
@@ -172,10 +186,6 @@
 }
 
 /* ---- Footer "Manual Order" switch ---- */
-/* RA's footer rows use a legacy "align-center" class that doesn't actually
-   center flex children — make sure the switch and the Edit Badges button
-   stay vertically centered relative to each other. */
-.ra-footer-manual .flex.align-center.ml-2.gap-2 { align-items: center; }
 .ra-edit-slot { display: inline-flex; align-items: center; }
 .ra-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex: none; touch-action: manipulation; }
 .ra-switch input { opacity: 0; width: 0; height: 0; }
@@ -215,7 +225,21 @@
 }
 
 /* ---- Edit mode (manual order / hide) ---- */
-#gameawards .ra-beaten-section .ra-edit-btn { margin-left: 10px; }
+/* Reset / Discard / Save bar, shown under the Beaten label while editing.
+   The counters stay in their normal place on the right of the label. */
+#gameawards .ra-edit-bar { margin: 8px 0 4px; }
+#gameawards .ra-bar-main,
+#gameawards .ra-bar-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#gameawards .ra-bar-spacer { flex: 1 1 auto; }
+#gameawards .ra-bar-confirm { display: none; }
+#gameawards .ra-edit-bar[data-confirm] .ra-bar-main { display: none; }
+#gameawards .ra-edit-bar[data-confirm] .ra-bar-confirm { display: flex; }
+#gameawards .ra-bar-msg { flex: 1 1 200px; font-size: 0.8125rem; }
 #gameawards .ra-beaten-grid .ra-tile { position: relative; }
 
 /* Disable RA's hover tooltips and link navigation on badges while editing —
@@ -306,14 +330,18 @@
    variant). */
 body[data-scheme="light"] .ra-footer-export-btn:hover:not(:disabled),
 body[data-scheme="light"] .ra-footer-import-btn:hover:not(:disabled),
-body[data-scheme="light"] .ra-edit-btn:hover:not(:disabled) {
+body[data-scheme="light"] .ra-sync-btn:hover:not(:disabled),
+body[data-scheme="light"] .ra-edit-btn:hover:not(:disabled),
+body[data-scheme="light"] .ra-bar-btn:hover:not(:disabled) {
   color: var(--link-hover-color, #000000);
   border-color: var(--menu-link-color, #424242);
 }
 @media (prefers-color-scheme: light) {
   body[data-scheme="system"] .ra-footer-export-btn:hover:not(:disabled),
   body[data-scheme="system"] .ra-footer-import-btn:hover:not(:disabled),
-  body[data-scheme="system"] .ra-edit-btn:hover:not(:disabled) {
+  body[data-scheme="system"] .ra-sync-btn:hover:not(:disabled),
+  body[data-scheme="system"] .ra-edit-btn:hover:not(:disabled),
+  body[data-scheme="system"] .ra-bar-btn:hover:not(:disabled) {
     color: var(--link-hover-color, #000000);
     border-color: var(--menu-link-color, #424242);
   }

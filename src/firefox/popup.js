@@ -19,7 +19,11 @@
     ["pct-desc", "Percentage (highest)"],
     ["pct-asc", "Percentage (lowest)"],
     ["title-asc", "Game Title (A-Z)"],
-    ["title-desc", "Game Title (Z-A)"]
+    ["title-desc", "Game Title (Z-A)"],
+    ["ttb-asc", "Time to Beat (shortest)"],
+    ["ttb-desc", "Time to Beat (longest)"],
+    ["unl-desc", "Last Unlock (newest)"],
+    ["unl-asc", "Last Unlock (oldest)"]
   ];
   var THEME_OPTIONS = [
     ["auto", "Auto (match site)"],
@@ -60,9 +64,14 @@
     } catch (e) {}
   }
 
+  // Same rule as content.js: the beaten-list cache and the captured site
+  // theme are internal data, not settings.
   function knownSettingsKey(k) {
     if (LEGACY_KEYS.indexOf(k) !== -1) return true;
-    return k.indexOf("rabg-") === 0 && k !== "rabg-store" && k !== "rabg-site-theme";
+    if (k.indexOf("rabg-") !== 0) return false;
+    if (k === "rabg-store" || k === "rabg-site-theme" || k === "rabg-scheme") return false;
+    if (k === "rabg-cache-index" || k.indexOf("rabg-cache-") === 0) return false;
+    return true;
   }
 
   // Applies the site theme captured by the content script: first the
@@ -220,7 +229,7 @@
     colorVal.textContent = colorRange.value + "%";
     syncRangeFill(colorRange);
     setKey(COLOR_KEY, colorRange.value);
-  });;
+  });
   manualBox.addEventListener("change", function () {
     setKey(MANUAL_ENABLED_KEY, manualBox.checked ? "1" : "0");
     refreshEditButton();
@@ -235,15 +244,40 @@
   function setEditButton(state) {
     // The button is always visible; it's enabled only when the active tab
     // is the viewer's own profile AND Manual Order is on (our own checkbox —
-    // instant, never racy). The label also never says "Finish Editing"
+    // instant, never racy). The label also never says "Save"
     // while manual is off — the page cancels edit mode when manual goes
     // off, and this local rule avoids the storage round-trip race.
     var own = !!(state && state.ok && state.ownProfile);
-    editBtn.disabled = !(own && manualBox.checked);
-    editBtn.textContent = (state && state.editing && manualBox.checked)
-      ? "Finish Editing" : "Edit Badges";
+    var editing = !!(state && state.editing && manualBox.checked);
+    var loading = !!(state && state.sync && state.sync.state === "loading");
+    editBtn.disabled = !(own && manualBox.checked) || (loading && !editing);
+    editBtn.textContent = editing ? "Save" : "Edit Badges";
     // Import needs a live RA tab (it shows an in-page file prompt there).
     $("import").disabled = !(state && state.ok);
+    applySyncState(state);
+  }
+
+  // "Beaten Data → Sync": enabled on a profile page with a Beaten section; the
+  // status line shows loading progress / the last sync. While a sync runs the
+  // popup re-asks the page once a second so the progress stays live.
+  var syncBtn = $("sync");
+  var syncRow = $("sync-row");
+  var syncText = $("sync-status");
+  var syncPoll = null;
+  function applySyncState(state) {
+    var s = state && state.ok && state.sync ? state.sync : null;
+    syncBtn.disabled = !(s && s.can);
+    syncBtn.title = s && s.can ? "Reload the full beaten list from RetroAchievements"
+                               : "Open a RetroAchievements profile to sync";
+    var text = s ? s.text : "";
+    syncText.textContent = text;
+    syncRow.hidden = !text;
+    if (s && s.state === "loading") {
+      if (!syncPoll) syncPoll = setInterval(refreshEditButton, 1000);
+    } else if (syncPoll) {
+      clearInterval(syncPoll);
+      syncPoll = null;
+    }
   }
 
   function refreshEditButton() {
@@ -251,6 +285,12 @@
       sendToTab(tabId, { type: "rabg-get-state" }, setEditButton);
     });
   }
+
+  syncBtn.addEventListener("click", function () {
+    withActiveTab(function (tabId) {
+      sendToTab(tabId, { type: "rabg-sync" }, applySyncState);
+    });
+  });
 
   editBtn.addEventListener("click", function () {
     withActiveTab(function (tabId) {

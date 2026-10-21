@@ -24,3 +24,20 @@
 - Fixed a layout issue on mobile that caused extension to create an excessive whitespace below the footer.
 - Fixed an issue on touch devices where dragging Beaten badges would scroll the page instead of moving the badge.
 - Improved Manual Order toggle responsiveness on touch devices.
+
+# v1.4.0 (2026/10/21)
+- RABG now shows **all** of your beaten games, not just the ones RetroAchievements lists under Completion Progress (i.e. profiles with over a thousand beaten games now work too). The complete list is loaded in the background from the progress pages: badges appear as they arrive, and the list is remembered, so the next visit is instant. It is refreshed automatically whenever your beaten totals change.
+- New **Sync** button to reload the full list manually. A status line shows the progress and the last sync time, and "Synced ✓" appears next to the Beaten title when it's done.
+- New Beaten Sort options: "Time to Beat" (shortest / longest) and "Last Unlock" (newest / oldest). Last Unlock is the date of your most recent achievement unlock in that game.
+- Manual Order editing has a new toolbar under the Beaten title: **Reset** (back to the default order, with a confirmation), **Discard** (leave without saving) and **Save** (renamed from "Finish Editing").
+- Without a saved arrangement, Manual Order now follows your Sort setting.
+- Remembered lists are kept for the 20 most recently visited profiles; your own profile is always kept and doesn't count towards that limit.
+- Settings import now checks the file and tells you what was imported (or why not). Export no longer includes cached game data.
+- Fixed: a damaged or hand-edited Manual Order setting could make the whole Beaten section disappear.
+- Fixed: saving a Manual Order arrangement could forget the order/hidden state of games that weren't shown at that moment.
+- Fixed: the Beaten Size / Beaten Color sliders could jump back while dragging.
+- Fixed: Manual Order didn't work when the capitalization of the profile URL differed from your username. Your existing arrangement is kept.
+- Fixed: scrolling on a phone could flip the Manual Order switch if your finger ended on it.
+- Fixed: a stray divider line could appear on profiles without Mastered badges after changing a setting.
+- The extension no longer does background work on pages other than profiles.
+- Various small clean-ups and improvements.

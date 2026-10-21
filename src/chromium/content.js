@@ -17,7 +17,7 @@
  *   badges render in a personally arranged order. "Edit Badges" starts an
  *   edit mode: press-and-hold-drag to reorder (mouse + touch), ✕ hides a
  *   badge (hidden badges sit at the end, half-transparent, restorable via
- *   ＋), "Finish Editing" saves. New beaten games append at the end,
+ *   ＋), "Save" keeps it, "Discard" leaves, "Reset" restores the default. New beaten games append at the end,
  *   visible. Data is per-profile: {order:[gameIds], hidden:[gameIds]}.
  *
  * Storage: all RABG settings live in the extension's storage.local
@@ -29,6 +29,13 @@
  *   Status; the hover notes "(N hidden)" = true total − badges shown.
  * - Creates a Game Awards box for profiles that have none.
  * - Games already mastered are excluded from Beaten.
+ * - Complete beaten list: the profile's Completion Progress only lists the
+ *   games with the highest completion %, so when the true beaten total is
+ *   larger the script reads the user's progress pages (filtered to "beaten",
+ *   100 games per page) in the background, shows games as they arrive and
+ *   caches the result per profile (refreshed when the beaten totals change,
+ *   or via the Sync button). The same pages carry time-to-beat and the
+ *   last-unlock date, which power the extra sort options.
  */
 (function () {
   "use strict";
@@ -41,6 +48,15 @@
   var COLOR_KEY = "rabg-beaten-color";  // "0"–"100" (% color; 0 = grayscale)
   var MANUAL_ENABLED_KEY = "rabg-manual-enabled"; // "1" / "0"
   var MANUAL_KEY_PREFIX = "rabg-manual-";         // + username → {order, hidden}
+  var MANUAL_USER_PREFIX = "rabg-manual-u-";   // + lowercased username → {order, hidden}
+  var POPUP_THEME_KEY = "rabg-popup-theme";
+  var CACHE_PREFIX = "rabg-cache-";            // + lowercased username → complete beaten list
+  var CACHE_INDEX_KEY = "rabg-cache-index";    // LRU list of cached usernames
+  var CACHE_VERSION = 1;
+  var FLASH_MS = 4000;             // how long "Synced ✓" stays next to the Beaten label
+  var CACHE_MAX_PROFILES = 20;     // other people's profiles (your own never counts)
+  var SYNC_PAGE_DELAY_MS = 400;                // politeness delay between progress pages
+  var SYNC_MAX_PAGES = 60;                     // safety cap (6,000 beaten games)
   var LEGACY_KEYS = [SORT_KEY, SIZE_KEY, COLOR_KEY];
   var GRID_CLASSES =
     "component w-full place-content-center bg-embed gap-2 grid " +
@@ -49,7 +65,11 @@
     ["pct-desc", "Percentage (highest)"],
     ["pct-asc", "Percentage (lowest)"],
     ["title-asc", "Game Title (A-Z)"],
-    ["title-desc", "Game Title (Z-A)"]
+    ["title-desc", "Game Title (Z-A)"],
+    ["ttb-asc", "Time to Beat (shortest)"],
+    ["ttb-desc", "Time to Beat (longest)"],
+    ["unl-desc", "Last Unlock (newest)"],
+    ["unl-asc", "Last Unlock (oldest)"]
   ];
   var HOLD_MS = 150; // press-and-hold time before a badge can be dragged
 
@@ -98,6 +118,19 @@
       var obj = {};
       obj[key] = value;
       storageSetItems(getStorageApi().local, obj);
+    } else {
+      persistStore();
+    }
+  }
+
+  function storeRemove(key) {
+    delete STORE[key];
+    if (usingExtStorage) {
+      try {
+        var area = getStorageApi().local;
+        var p = area.remove(key);
+        if (p && typeof p.catch === "function") p.catch(function () {});
+      } catch (e) {}
     } else {
       persistStore();
     }
@@ -164,7 +197,9 @@
       }
       applyBeatenStyles();
       syncFooterControls(); // keep footer widgets (select/sliders/switch) in sync
-      if (structural) refreshBeatenSection();
+      if (structural) {
+        refreshBeatenSection();
+      }
     });
   }
 
@@ -190,14 +225,64 @@
   function setManualEnabled(on) { storeSet(MANUAL_ENABLED_KEY, on ? "1" : "0"); }
 
   function safeParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
-  function getManualData(username) {
-    var v = STORE[MANUAL_KEY_PREFIX + username];
-    if (!v) return null;
-    var d = (typeof v === "string") ? safeParse(v) : v;
-    if (!d || typeof d !== "object" || !d.order || !d.hidden) return null;
-    return d;
+
+  // RA usernames are case-insensitive (/user/Alp7 and /user/alp7 are the same
+  // profile), so every comparison and every storage key uses lowercase.
+  function sameUser(a, b) {
+    return !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
   }
-  function setManualData(username, data) { storeSet(MANUAL_KEY_PREFIX + username, data); }
+
+  // Game-ID list → array of unique digit strings (anything else is dropped).
+  function cleanIdList(v) {
+    var out = [], seen = Object.create(null);
+    if (!Array.isArray(v)) return out;
+    for (var i = 0; i < v.length; i++) {
+      var id = String(v[i]);
+      if (/^\d+$/.test(id) && !seen[id]) { seen[id] = true; out.push(id); }
+    }
+    return out;
+  }
+
+  // Validates manual-order data ({order:[…], hidden:[…]}); null if unusable.
+  // Corrupt or hand-edited data must never be able to break the page.
+  function cleanManual(v) {
+    if (typeof v === "string") v = safeParse(v);
+    if (!v || typeof v !== "object" || !Array.isArray(v.order) || !Array.isArray(v.hidden)) return null;
+    return { order: cleanIdList(v.order), hidden: cleanIdList(v.hidden) };
+  }
+
+  // Keys saved by v1.3.x look like "rabg-manual-<name as spelled in the URL>".
+  function isLegacyManualKey(k) {
+    return k.indexOf(MANUAL_KEY_PREFIX) === 0 && k !== MANUAL_ENABLED_KEY &&
+           k.indexOf(MANUAL_USER_PREFIX) !== 0;
+  }
+
+  function getManualData(username) {
+    var lower = String(username || "").toLowerCase();
+    if (!lower) return null;
+    var d = cleanManual(STORE[MANUAL_USER_PREFIX + lower]);
+    if (d) return d;
+    for (var k in STORE) { // data saved by v1.3.x, whatever spelling it used
+      if (isLegacyManualKey(k) && k.slice(MANUAL_KEY_PREFIX.length).toLowerCase() === lower) {
+        d = cleanManual(STORE[k]);
+        if (d) return d;
+      }
+    }
+    return null;
+  }
+  function setManualData(username, data) {
+    storeSet(MANUAL_USER_PREFIX + String(username).toLowerCase(), data);
+  }
+  // Deletes the saved arrangement (current and v1.3.x keys) → default order.
+  function clearManualData(username) {
+    var lower = String(username || "").toLowerCase();
+    if (!lower) return;
+    var doomed = [MANUAL_USER_PREFIX + lower];
+    for (var k in STORE) {
+      if (isLegacyManualKey(k) && k.slice(MANUAL_KEY_PREFIX.length).toLowerCase() === lower) doomed.push(k);
+    }
+    for (var i = 0; i < doomed.length; i++) storeRemove(doomed[i]);
+  }
 
   // Applies the saved size/grayscale to all beaten tiles via CSS variables.
   function applyBeatenStyles() {
@@ -424,10 +509,427 @@
     return list;
   }
 
+  /* ---------- complete beaten list: progress pages, cache, sync -------- */
+
+  // The profile's Completion Progress only lists the games with the highest
+  // completion %. The user's dedicated progress page, filtered to "beaten",
+  // lists every beaten game (100 per page) and also shows, per game, the
+  // time-to-beat and the date of the last achievement unlock. (That date is
+  // NOT the beaten date — RA only shows that in the hover tooltip.)
+  //
+  // Flow: the Beaten section is always built from the user's complete list on
+  // the progress pages (not from the shorter list printed on the profile).
+  // If this profile's list is cached and its signature (the Progression Status
+  // totals) still matches, the cache is used with no network access at all.
+  // Otherwise the pages are fetched in the background, one by one, and the
+  // section is refreshed as they arrive; the finished list is cached. The Sync
+  // button forces a refetch. The profile's own short list is only a fallback
+  // for when nothing else is available (e.g. the sync failed).
+
+  var beatenExtra = emptyExtra();
+  var syncToken = 0;
+
+  function isProfilePage() { return /^\/user\/[^\/]+\/?$/.test(location.pathname); }
+
+  var MONTHS = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6,
+    august: 7, september: 8, october: 9, november: 10, december: 11
+  };
+  var DURATION_UNITS = {
+    second: 1, minute: 60, hour: 3600, day: 86400, week: 604800,
+    month: 2592000, year: 31536000
+  };
+
+  function cleanText(el) { return (el.textContent || "").replace(/\s+/g, " ").trim(); }
+  function isSafeImg(src) { return typeof src === "string" && /^(https:\/\/|\/)[^\s"'<>]+$/.test(src); }
+
+  // "34 hours, 52 minutes" → seconds (null if nothing recognizable).
+  function parseDuration(text) {
+    var re = /(\d[\d,]*)\s*(second|minute|hour|day|week|month|year)s?/gi;
+    var m, total = 0, found = false;
+    while ((m = re.exec(text))) {
+      found = true;
+      total += parseInt(m[1].replace(/,/g, ""), 10) * DURATION_UNITS[m[2].toLowerCase()];
+    }
+    return found ? total : null;
+  }
+
+  // "October 19 2026" → UTC timestamp (null if it isn't a date).
+  function parseDateText(text) {
+    var m = /^([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})$/.exec(text);
+    if (!m) return null;
+    var mon = MONTHS[m[1].toLowerCase()];
+    if (mon === undefined) return null;
+    return Date.UTC(parseInt(m[3], 10), mon, parseInt(m[2], 10));
+  }
+
+  // Reads one progress page (already parsed into a document).
+  // → { games:[…], total:<filtered game count or null>, hasNext:bool }
+  function parseProgressDoc(doc) {
+    var games = [];
+    var roots = doc.querySelectorAll(".cprogress-pmeta__root");
+    for (var i = 0; i < roots.length; i++) {
+      var root = roots[i];
+      var li = root.closest ? root.closest("li") : null;
+      if (!li) continue;
+      var awardEl = li.querySelector("[data-award]");
+      var award = awardEl ? awardEl.getAttribute("data-award") : "";
+      var type = award === "beaten-hardcore" ? "hc"
+               : award === "beaten-softcore" ? "sc"
+               : award === "beaten" ? "hc" : null;
+      if (!type) continue;
+      var link = root.querySelector('a[href*="/game/"]') || li.querySelector('a[href*="/game/"]');
+      var img = li.querySelector("img");
+      if (!link || !img) continue;
+      var m = (link.getAttribute("href") || "").match(/\/game\/(\d+)/);
+      var src = img.getAttribute("src") || "";
+      if (!m || !isSafeImg(src)) continue;
+
+      var pct = 0, ttb = null, unl = null;
+      var ps = root.querySelectorAll("p");
+      for (var j = 0; j < ps.length; j++) {
+        var t = cleanText(ps[j]);
+        var am = /(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+achievements/i.exec(t);
+        if (am) {
+          var n = parseInt(am[1].replace(/,/g, ""), 10), d = parseInt(am[2].replace(/,/g, ""), 10);
+          if (d > 0) pct = n / d;
+        } else if (/beaten/i.test(t)) {
+          // "Beaten in 34 hours, 52 minutes over 7 days, 22 hours" — only the
+          // part after "in" (play time) is the time to beat.
+          var bm = /beaten\s+in\s+(.*?)(?:\s+over\s+|$)/i.exec(t);
+          if (bm) ttb = parseDuration(bm[1]);
+        } else {
+          var dt = parseDateText(t);
+          if (dt !== null) unl = dt;
+        }
+      }
+      if (!pct) pct = completionOf(li);
+
+      games.push({
+        gameId: m[1], imgSrc: src, pct: pct, type: type,
+        title: cleanText(link), ttb: ttb, unl: unl
+      });
+    }
+
+    var total = null;
+    var allP = doc.querySelectorAll("p");
+    for (var k = 0; k < allP.length; k++) {
+      var vm = /^Viewing\s+([\d,]+)\s+of\s+[\d,]+/i.exec(cleanText(allP[k]));
+      if (vm) { total = parseInt(vm[1].replace(/,/g, ""), 10); break; }
+    }
+    return { games: games, total: total, hasNext: !!doc.querySelector('a[title="Next"][href]') };
+  }
+
+  function fetchProgressPage(user, page, useSort) {
+    var url = location.origin + "/user/" + encodeURIComponent(user) +
+      "/progress?filter%5Bstatus%5D=any-beaten" +
+      (useSort ? "&sort=game_title" : "") +        // stable order across pages
+      "&page%5Bnumber%5D=" + page;
+    return fetch(url, { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.text();
+      })
+      .then(function (html) {
+        return parseProgressDoc(new DOMParser().parseFromString(html, "text/html"));
+      });
+  }
+
+  /* --- cache (storage.local, one entry per profile, LRU of 10) --- */
+
+  function cacheKeyFor(user) { return CACHE_PREFIX + String(user).toLowerCase(); }
+
+  // Compact on-disk form: [id, title, img, pct, hardcore(1/0), ttb, unl]
+  function packGame(g) {
+    return [g.gameId, g.title, g.imgSrc, Math.round(g.pct * 10000) / 10000,
+            g.type === "hc" ? 1 : 0,
+            typeof g.ttb === "number" ? g.ttb : null,
+            typeof g.unl === "number" ? g.unl : null];
+  }
+  function unpackGame(a) {
+    if (!Array.isArray(a) || a.length < 7) return null;
+    var id = String(a[0]);
+    if (!/^\d+$/.test(id) || !isSafeImg(a[2])) return null;
+    return {
+      gameId: id, title: String(a[1] || ""), imgSrc: a[2], pct: +a[3] || 0,
+      type: a[4] ? "hc" : "sc",
+      ttb: typeof a[5] === "number" ? a[5] : null,
+      unl: typeof a[6] === "number" ? a[6] : null
+    };
+  }
+
+  function readCache(user) {
+    var c = STORE[cacheKeyFor(user)];
+    if (!c || typeof c !== "object" || c.v !== CACHE_VERSION ||
+        typeof c.sig !== "string" || !Array.isArray(c.g)) return null;
+    var games = Object.create(null), n = 0;
+    for (var i = 0; i < c.g.length; i++) {
+      var g = unpackGame(c.g[i]);
+      if (g && !games[g.gameId]) { games[g.gameId] = g; n++; }
+    }
+    return { sig: c.sig, t: +c.t || 0, games: games, count: n };
+  }
+
+  function writeCache(user, sig, games) {
+    var lower = String(user).toLowerCase();
+    var arr = [];
+    for (var id in games) arr.push(packGame(games[id]));
+    storeSet(cacheKeyFor(lower), { v: CACHE_VERSION, sig: sig, t: Date.now(), g: arr });
+    var idx = Array.isArray(STORE[CACHE_INDEX_KEY]) ? STORE[CACHE_INDEX_KEY].slice() : [];
+    idx = idx.filter(function (u) { return u !== lower; });
+    idx.push(lower);
+    // Keep the newest CACHE_MAX_PROFILES profiles of OTHER people. The
+    // viewer's own profile is never evicted and doesn't count toward the limit.
+    var me = String(getViewerUsername() || "").toLowerCase();
+    var others = idx.filter(function (u) { return u !== me; });
+    var drop = others.slice(0, Math.max(0, others.length - CACHE_MAX_PROFILES));
+    for (var i = 0; i < drop.length; i++) storeRemove(CACHE_PREFIX + drop[i]);
+    if (drop.length) idx = idx.filter(function (u) { return drop.indexOf(u) === -1; });
+    storeSet(CACHE_INDEX_KEY, idx);
+  }
+
+  // Signature of what a cache must match: the profile's true beaten totals.
+  function currentSig(totals) { return totals ? (totals.hc + "-" + totals.sc) : ""; }
+
+  function emptyExtra() {
+    return { user: "", sig: "", games: null, state: "idle", loaded: 0, total: 0,
+             at: 0, error: "", flashUntil: 0 };
+  }
+
+  // Before the first render: reuse the cached complete list when it is current.
+  function prepareBeatenData(totals) {
+    if (!isProfilePage()) return;
+    var user = getUsername().toLowerCase();
+    var sig = currentSig(totals);
+    if (!user || !sig) return;
+    if (beatenExtra.user && beatenExtra.user !== user) { // moved to another profile
+      syncToken++;
+      beatenExtra = emptyExtra();
+    }
+    if (beatenExtra.state === "loading") return;
+    if (beatenExtra.state === "done" && beatenExtra.user === user && beatenExtra.sig === sig) return;
+    var c = readCache(user);
+    if (c && c.sig === sig) {
+      beatenExtra = { user: user, sig: sig, games: c.games, state: "done",
+                      loaded: c.count, total: c.count, at: c.t, error: "", flashUntil: 0 };
+    }
+  }
+
+  // Orders a list of games like the Sort setting does (used for the default
+  // order of Manual Order, and by the Sort select via sortBeatenTiles).
+  function compareStr(a, b) {
+    a = a || ""; b = b || "";
+    try { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); }
+    catch (e) { return a < b ? -1 : (a > b ? 1 : 0); }
+  }
+  function sortGames(list, key) {
+    var m = /^(pct|ttb|unl)-(asc|desc)$/.exec(key);
+    var field = m ? m[1] : (key === "title-asc" || key === "title-desc" ? "title" : "pct");
+    var dir = (m ? m[2] : (key === "title-desc" ? "desc" : "asc")) === "asc" ? 1 : -1;
+    if (!m && key !== "title-asc" && key !== "title-desc") { field = "pct"; dir = -1; }
+    list.sort(function (a, b) {
+      if (field === "title") return dir * compareStr(a.title, b.title);
+      var va = typeof a[field] === "number" ? a[field] : null;
+      var vb = typeof b[field] === "number" ? b[field] : null;
+      if (va === null && vb === null) return compareStr(a.title, b.title);
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      if (va !== vb) return dir * (va - vb);
+      return compareStr(a.title, b.title);
+    });
+    return list;
+  }
+
+  // The beaten games to show: the user's complete list from the progress pages
+  // (cache or a running/finished sync), minus games shown as Mastered.
+  // Only if that list isn't available at all (the sync failed and nothing is
+  // cached, or the page layout changed) fall back to the shorter list that
+  // RetroAchievements prints on the profile itself.
+  function getAllBeaten(excludeIds) {
+    var out = [];
+    var extra = beatenExtra.user === getUsername().toLowerCase() ? beatenExtra.games : null;
+    if (extra) {
+      for (var id in extra) {
+        if (excludeIds && excludeIds[id]) continue;
+        var e = extra[id];
+        out.push({ gameId: e.gameId, imgSrc: e.imgSrc, pct: e.pct, type: e.type,
+                   title: e.title, ttb: e.ttb, unl: e.unl });
+      }
+    }
+    if (!out.length && beatenExtra.state !== "loading") return getBeatenGames(excludeIds);
+    return sortGames(out, getSortPref());
+  }
+
+  function countKeys(o) { var n = 0; for (var k in o) n++; return n; }
+
+  function unionMaps(primary, secondary) {
+    var out = Object.create(null), k;
+    if (secondary) for (k in secondary) out[k] = secondary[k];
+    for (k in primary) out[k] = primary[k];
+    return out;
+  }
+
+  // Fetches every page of the user's beaten list, refreshing the Beaten
+  // section after each one. `manual` = the Sync button (shows a confirmation
+  // when it is done, because the list often looks the same afterwards).
+  function startSync(manual) {
+    if (!isProfilePage() || beatenExtra.state === "loading") return false;
+    var user = getUsername();
+    if (!user || typeof fetch !== "function") return false;
+    var sig = currentSig(getBeatenTotals());
+    var token = ++syncToken;
+    var lower = user.toLowerCase();
+    // Keep showing older data of the same profile while the new data loads.
+    var previous = beatenExtra.user === lower ? beatenExtra.games : null;
+    var fresh = Object.create(null);
+    var page = 1, useSort = true;
+    beatenExtra = { user: lower, sig: sig, games: previous,
+                    state: "loading", loaded: 0, total: 0, at: 0, error: "", flashUntil: 0 };
+    updateSyncUI();
+    if (previous) refreshBeatenSection();
+
+    function fail(err) {
+      if (token !== syncToken) return;
+      console.info("[RABG] Sync failed on page " + page + ":", err);
+      beatenExtra.state = "error";
+      beatenExtra.error = String((err && err.message) || err).slice(0, 60);
+      beatenExtra.games = unionMaps(fresh, previous);
+      refreshBeatenSection();
+      updateSyncUI();
+    }
+
+    function step() {
+      if (token !== syncToken) return;
+      fetchProgressPage(user, page, useSort).then(function (res) {
+        if (token !== syncToken) return;
+        if (!res.games.length && page === 1) throw new Error("no games found on the progress page");
+        var added = 0;
+        for (var i = 0; i < res.games.length; i++) {
+          var g = res.games[i];
+          if (!fresh[g.gameId]) { fresh[g.gameId] = g; added++; }
+        }
+        if (res.total !== null && !beatenExtra.total) beatenExtra.total = res.total;
+        beatenExtra.loaded = countKeys(fresh);
+        var finished = !res.hasNext || added === 0 || page >= SYNC_MAX_PAGES ||
+          (beatenExtra.total && beatenExtra.loaded >= beatenExtra.total);
+        if (finished) {
+          beatenExtra.games = fresh;
+          beatenExtra.state = "done";
+          beatenExtra.at = Date.now();
+          if (manual) beatenExtra.flashUntil = Date.now() + FLASH_MS;
+          if (sig) writeCache(user, sig, fresh);
+          console.info("[RABG] Synced " + beatenExtra.loaded + " beaten games in " + page + " page(s).");
+        } else {
+          beatenExtra.games = unionMaps(fresh, previous);
+        }
+        // Re-render after every page at first; for very large lists only every
+        // third page (the final result is always rendered).
+        if (finished || page <= 5 || page % 3 === 0) refreshBeatenSection();
+        updateSyncUI();
+        if (!finished) { page++; setTimeout(step, SYNC_PAGE_DELAY_MS); }
+      }).catch(function (err) {
+        if (page === 1 && useSort && !countKeys(fresh)) {  // retry once without the sort hint
+          useSort = false;
+          step();
+          return;
+        }
+        fail(err);
+      });
+    }
+    step();
+    return true;
+  }
+
+  // Runs when a profile is shown: use the cached list if it is current,
+  // otherwise load the complete list from the progress pages. Nothing is
+  // fetched when the cache matches (until the user presses Sync).
+  function maybeAutoSync() {
+    if (!isProfilePage()) return;
+    var user = getUsername().toLowerCase();
+    if (!user) return;
+    var totals = getBeatenTotals();
+    var sig = currentSig(totals);
+    if (!sig || totals.hc + totals.sc === 0) return;   // nothing to load
+    prepareBeatenData(totals);                          // adopts a current cache
+    if (beatenExtra.state === "loading") return;
+    if (beatenExtra.user === user && beatenExtra.sig === sig &&
+        (beatenExtra.state === "done" || beatenExtra.state === "error")) return; // error: retry = Sync button
+    startSync(false);
+  }
+
+  function formatSyncTime(t) {
+    try {
+      return new Date(t).toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+      });
+    } catch (e) { return new Date(t).toISOString(); }
+  }
+
+  function syncStatusText() {
+    var s = beatenExtra;
+    if (s.state === "loading") return "Loading beaten games… " + s.loaded + (s.total ? "/" + s.total : "");
+    if (s.state === "error") return "Sync failed (" + (s.error || "unknown error") + ") — try again";
+    if (s.state === "done" && s.at) return s.loaded + " games synced · " + formatSyncTime(s.at);
+    return "";
+  }
+
+  function syncInfo() {
+    var awards = document.getElementById("gameawards");
+    var can = isProfilePage() && !!awards && !!awards.querySelector(".ra-beaten-section") &&
+              beatenExtra.state !== "loading";
+    return { state: beatenExtra.state, text: syncStatusText(), can: can };
+  }
+
+  var flashTimer = null;
+
+  // Keeps the footer Sync row and the little status hint next to the Beaten
+  // label ("Loading… 100/208", then "Synced ✓" for a few seconds) in step with
+  // the sync state.
+  function updateSyncUI() {
+    var info = syncInfo();
+    var btn = document.querySelector(".ra-sync-btn");
+    if (btn) {
+      btn.disabled = !info.can;
+      btn.title = info.can ? "Reload the full beaten list from RetroAchievements"
+                           : "Open a RetroAchievements profile to sync";
+    }
+    var st = document.querySelector(".ra-sync-status");
+    if (st && st.textContent !== info.text) {
+      st.textContent = info.text;
+      fixFooterHeight(); // the text can wrap on narrow screens and make the footer taller
+    }
+    var label = document.querySelector("#gameawards .ra-beaten-section .ra-grouplabel");
+    if (label) {
+      var hint = label.querySelector(".ra-loading");
+      var text = "";
+      if (beatenExtra.state === "loading") {
+        text = "Loading… " + beatenExtra.loaded + (beatenExtra.total ? "/" + beatenExtra.total : "");
+      } else if (beatenExtra.state === "done" && Date.now() < beatenExtra.flashUntil) {
+        text = "Synced " + beatenExtra.loaded + " games ✓";
+        if (!flashTimer) {
+          flashTimer = setTimeout(function () { flashTimer = null; updateSyncUI(); }, FLASH_MS + 100);
+        }
+      } else if (beatenExtra.state === "error") {
+        text = "Sync failed";
+      }
+      if (text) {
+        if (!hint) {
+          hint = document.createElement("span");
+          hint.className = "ra-loading";
+          var lbl = label.querySelector(".ra-lbl");
+          label.insertBefore(hint, lbl ? lbl.nextSibling : label.firstChild);
+        }
+        if (hint.textContent !== text) hint.textContent = text;
+      } else if (hint && hint.parentNode) {
+        hint.parentNode.removeChild(hint);
+      }
+    }
+  }
+
   /* ---------- manual ordering ----------------------------------------- */
 
   function manualIsActive(username, viewer) {
-    return !!(viewer && username && viewer === username && isManualEnabled());
+    return !!(sameUser(viewer, username) && isManualEnabled());
   }
 
   // Splits beaten games per manual data: `visible` in the saved order (with
@@ -506,13 +1008,18 @@
     wrap.setAttribute("data-pct", game.pct.toFixed(4));
     wrap.setAttribute("data-tier", game.type);
     wrap.setAttribute("data-title", game.title || "");
+    wrap.setAttribute("data-ttb", typeof game.ttb === "number" ? String(game.ttb) : "");
+    wrap.setAttribute("data-unl", typeof game.unl === "number" ? String(game.unl) : "");
 
+    // The username ends up inside an Alpine expression: only pass it on when
+    // it is a plain RA-style name (letters, digits, _ . -).
+    var ctxName = /^[A-Za-z0-9_.\-]+$/.test(username || "") ? username : "";
     var span = document.createElement("span");
     span.className = "inline";
     span.setAttribute(
       "x-data",
       "tooltipComponent($el, { dynamicType: 'game', dynamicId: '" + game.gameId + "'" +
-        (username ? ", dynamicContext: '" + username + "'" : "") + " })"
+        (ctxName ? ", dynamicContext: '" + ctxName + "'" : "") + " })"
     );
     span.setAttribute("x-on:mouseover", "showTooltip($event)");
     span.setAttribute("x-on:mouseleave", "hideTooltip");
@@ -520,7 +1027,7 @@
 
     var a = document.createElement("a");
     a.className = "inline-block";
-    a.href = "https://retroachievements.org/game/" + game.gameId;
+    a.href = "/game/" + game.gameId;
 
     var img = document.createElement("img");
     img.loading = "lazy";
@@ -557,17 +1064,39 @@
     return h3;
   }
 
+  function compareTitles(a, b) {
+    var ta = a.getAttribute("data-title") || "";
+    var tb = b.getAttribute("data-title") || "";
+    try { return ta.localeCompare(tb, undefined, { numeric: true, sensitivity: "base" }); }
+    catch (e) { return ta < tb ? -1 : (ta > tb ? 1 : 0); }
+  }
+
+  function tileNumber(el, attr) {
+    var v = el.getAttribute(attr);
+    if (v === null || v === "") return null;
+    var n = parseFloat(v);
+    return isFinite(n) ? n : null;
+  }
+
+  // Sorts the tiles of a beaten grid. Ties fall back to the title so the
+  // order is always deterministic; games without time-to-beat / unlock data
+  // always go last, whatever the direction.
   function sortBeatenTiles(grid, key) {
     var tiles = Array.prototype.slice.call(grid.children);
+    var m = /^(pct|ttb|unl)-(asc|desc)$/.exec(key);
+    var field = m ? m[1] : (key === "title-asc" || key === "title-desc" ? "title" : "pct");
+    var dir = (m ? m[2] : (key === "title-desc" ? "desc" : "asc")) === "asc" ? 1 : -1;
+    if (!m && key !== "title-asc" && key !== "title-desc") { field = "pct"; dir = -1; } // default: pct-desc
+    var attr = field === "pct" ? "data-pct" : (field === "ttb" ? "data-ttb" : "data-unl");
+
     tiles.sort(function (a, b) {
-      var pa = parseFloat(a.getAttribute("data-pct")) || 0;
-      var pb = parseFloat(b.getAttribute("data-pct")) || 0;
-      var ta = a.getAttribute("data-title") || "";
-      var tb = b.getAttribute("data-title") || "";
-      if (key === "pct-asc") return pa - pb;
-      if (key === "title-asc") return ta.localeCompare(tb);
-      if (key === "title-desc") return tb.localeCompare(ta);
-      return pb - pa; // pct-desc
+      if (field === "title") return dir * compareTitles(a, b);
+      var va = tileNumber(a, attr), vb = tileNumber(b, attr);
+      if (va === null && vb === null) return compareTitles(a, b);
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      if (va !== vb) return dir * (va - vb);
+      return compareTitles(a, b);
     });
     tiles.forEach(function (t) { grid.appendChild(t); });
   }
@@ -599,7 +1128,10 @@
     input.style.setProperty("--ra-fill", Math.max(0, Math.min(100, pct)) + "%");
   }
 
-  function buildRangeRow(rowClass, labelText, srText, min, max, step, value, onInput) {
+  // `onLive` runs on every tick of the drag (page-only, nothing is stored);
+  // `onCommit` runs once when the value is released and is what gets saved.
+  // Saving on every tick made the storage "echo" snap the slider back.
+  function buildRangeRow(rowClass, labelText, srText, min, max, step, value, onLive, onCommit) {
     var r = buildFooterRow(rowClass);
     r.label.textContent = labelText;
     var sr = document.createElement("label");
@@ -617,9 +1149,25 @@
     val.textContent = value + "%";
     range.addEventListener("input", function () { syncRangeFill(range); });
     syncRangeFill(range); // paint the correct fill before first display
+    function current() {
+      var v = parseInt(range.value, 10);
+      return isFinite(v) ? v : min;
+    }
     range.addEventListener("input", function () {
       val.textContent = range.value + "%";
-      onInput(parseInt(range.value, 10) || min);
+      onLive(current());
+    });
+    range.addEventListener("change", function () { onCommit(current()); });
+    // Mark the slider while a pointer drag is in progress (see syncFooterControls).
+    range.addEventListener("pointerdown", function () {
+      range.setAttribute("data-dragging", "1");
+      var release = function () {
+        range.removeAttribute("data-dragging");
+        window.removeEventListener("pointerup", release);
+        window.removeEventListener("pointercancel", release);
+      };
+      window.addEventListener("pointerup", release);
+      window.addEventListener("pointercancel", release);
     });
     r.controls.appendChild(sr);
     r.controls.appendChild(range);
@@ -662,9 +1210,21 @@
       input.checked = !input.checked;
       fireToggle(input.checked);
     });
-    // Touch devices: treat touchend as a toggle as well (prevents
-    // 300ms delay / missed taps in responsive mode).
+    // Touch devices: treat a tap (touchend) as a toggle as well, which avoids
+    // missed taps. A finger that moved is a scroll, not a tap — ignore it.
+    var touchX = 0, touchY = 0, touchMoved = false;
+    slider.addEventListener("touchstart", function (e) {
+      var t = e.touches && e.touches[0];
+      touchX = t ? t.clientX : 0;
+      touchY = t ? t.clientY : 0;
+      touchMoved = false;
+    }, { passive: true });
+    slider.addEventListener("touchmove", function (e) {
+      var t = e.touches && e.touches[0];
+      if (t && (Math.abs(t.clientX - touchX) > 10 || Math.abs(t.clientY - touchY) > 10)) touchMoved = true;
+    }, { passive: true });
     slider.addEventListener("touchend", function (e) {
+      if (touchMoved) return; // a scroll that happened to end here
       e.preventDefault();
       input.checked = !input.checked;
       fireToggle(input.checked);
@@ -676,9 +1236,44 @@
 
   /* ---------- settings backup (export / import) ------------------------ */
 
+  // Which stored keys count as user settings (exported / imported). The
+  // beaten-list cache, theme capture and fallback blob are internal data.
   function knownSettingsKey(k) {
     if (LEGACY_KEYS.indexOf(k) !== -1) return true;
-    return k.indexOf("rabg-") === 0 && k !== "rabg-store" && k !== "rabg-site-theme";
+    if (k.indexOf("rabg-") !== 0) return false;
+    if (k === "rabg-store" || k === "rabg-site-theme" || k === "rabg-scheme") return false;
+    if (k === CACHE_INDEX_KEY || k.indexOf(CACHE_PREFIX) === 0) return false;
+    return true;
+  }
+
+  // Validates one imported setting. Returns { key, value } to store, or null
+  // to skip it — a settings file can never put unusable data in storage.
+  function sanitizeImported(k, v) {
+    var i;
+    if (k === SORT_KEY) {
+      for (i = 0; i < SORT_OPTIONS.length; i++) if (SORT_OPTIONS[i][0] === v) return { key: k, value: v };
+      return null;
+    }
+    if (k === SIZE_KEY || k === COLOR_KEY) {
+      var n = parseInt(v, 10);
+      if (!isFinite(n)) return null;
+      var lo = k === SIZE_KEY ? 50 : 0;
+      return { key: k, value: String(Math.min(100, Math.max(lo, n))) };
+    }
+    if (k === MANUAL_ENABLED_KEY) return (v === "1" || v === "0") ? { key: k, value: v } : null;
+    if (k === POPUP_THEME_KEY) {
+      return (v === "auto" || v === "dark" || v === "black" || v === "light") ? { key: k, value: v } : null;
+    }
+    if (k.indexOf(MANUAL_KEY_PREFIX) === 0) {
+      // Manual order for one profile. Older exports used the name as spelled
+      // in the URL; everything is now stored under the lowercase name.
+      var name = k.indexOf(MANUAL_USER_PREFIX) === 0
+        ? k.slice(MANUAL_USER_PREFIX.length) : k.slice(MANUAL_KEY_PREFIX.length);
+      var d = cleanManual(v);
+      if (!name || !d) return null;
+      return { key: MANUAL_USER_PREFIX + name.toLowerCase(), value: d };
+    }
+    return null;
   }
 
   function buildExportPayload() {
@@ -707,24 +1302,57 @@
     }
   }
 
+  // Small status line next to the Export / Import buttons.
+  var backupMsgTimer = null;
+  function showBackupMessage(text) {
+    var row = document.querySelector(".ra-footer-backup");
+    if (!row) return;
+    var box = row.querySelector(".ra-backup-msg");
+    if (!box) {
+      box = document.createElement("span");
+      box.className = "ra-backup-msg";
+      (row.lastElementChild || row).appendChild(box); // the controls container
+    }
+    box.textContent = text;
+    fixFooterHeight();
+    if (backupMsgTimer) clearTimeout(backupMsgTimer);
+    backupMsgTimer = setTimeout(function () {
+      if (box.parentNode) box.parentNode.removeChild(box);
+      fixFooterHeight();
+    }, 8000);
+  }
+
   function doImport(file) {
     try {
       var reader = new FileReader();
       reader.onload = function () {
         var data = safeParse(String(reader.result));
-        if (!data || typeof data !== "object") return;
-        var count = 0;
-        for (var k in data) {
-          if (knownSettingsKey(k)) { storeSet(k, data[k]); count++; }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          showBackupMessage("Import failed: not a RABG settings file.");
+          return;
         }
-        if (!count) return;
+        var count = 0, skipped = 0;
+        for (var k in data) {
+          if (!knownSettingsKey(k)) { skipped++; continue; }
+          var clean = sanitizeImported(k, data[k]);
+          if (clean) { storeSet(clean.key, clean.value); count++; }
+          else skipped++;
+        }
+        if (!count) {
+          showBackupMessage("Nothing imported: no valid RABG settings found.");
+          return;
+        }
+        cancelEditModeIfActive();
         applyBeatenStyles();
         syncFooterControls();
         refreshBeatenSection();
+        showBackupMessage("Imported " + count + " setting" + (count === 1 ? "" : "s") +
+          (skipped ? " (" + skipped + " skipped)" : "") + ".");
       };
       reader.readAsText(file);
     } catch (e) {
       console.info("[RABG] Import failed: " + e);
+      showBackupMessage("Import failed.");
     }
   }
 
@@ -756,26 +1384,47 @@
 
   /* ---------- footer sync helpers -------------------------------------- */
 
-  // Manages the two edit buttons:
-  //  - "Edit Badges" in the footer, next to the Manual Order switch (hidden
-  //    while an edit is in progress).
-  //  - "Finish Editing" next to the Beaten counters (only while editing).
+  // Edit-mode controls:
+  //  - "Edit Badges" in the footer, next to the Manual Order switch (shown as
+  //    "Save" while an edit is in progress).
+  //  - A bar under the Beaten label while editing: [Reset]  …  [Discard] [Save].
   // Both appear only on the viewer's own profile with manual order on.
-  function setSlotButton(slot, show, label) {
-    if (!slot) return;
-    var btn = slot.querySelector(".ra-edit-btn");
-    if (!show) {
-      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
-      return;
-    }
-    if (!btn) {
-      btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "btn-base btn-base--default btn-base--size-sm ra-edit-btn";
-      btn.addEventListener("click", toggleEditMode);
-      slot.appendChild(btn);
-    }
-    btn.textContent = label;
+  function barButton(text, title, onClick) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn-base btn-base--default btn-base--size-sm ra-bar-btn";
+    b.textContent = text;
+    if (title) b.title = title;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function buildEditBar() {
+    var bar = document.createElement("div");
+    bar.className = "ra-edit-bar";
+
+    var main = document.createElement("div");
+    main.className = "ra-bar-main";
+    main.appendChild(barButton("Reset", "Back to the default order, with every badge shown",
+      function () { bar.setAttribute("data-confirm", "1"); }));
+    var spacer = document.createElement("span");
+    spacer.className = "ra-bar-spacer";
+    main.appendChild(spacer);
+    main.appendChild(barButton("Discard", "Leave without saving your changes", discardEditMode));
+    main.appendChild(barButton("Save", "Save this arrangement", saveEditMode));
+
+    var confirm = document.createElement("div");
+    confirm.className = "ra-bar-confirm";
+    var msg = document.createElement("span");
+    msg.className = "ra-bar-msg";
+    msg.textContent = "Reset to the default order? Your saved order and hidden badges will be deleted.";
+    confirm.appendChild(msg);
+    confirm.appendChild(barButton("Yes, reset", "", resetEditMode));
+    confirm.appendChild(barButton("Cancel", "", function () { bar.removeAttribute("data-confirm"); }));
+
+    bar.appendChild(main);
+    bar.appendChild(confirm);
+    return bar;
   }
 
   function updateFooterEditButton() {
@@ -787,7 +1436,8 @@
     var active = ctx.manualActive && !!bLabel;
 
     // Footer: "Edit Badges" is ALWAYS visible next to the switch, but it'll be
-    // disabled unless this is the viewer's own profile with Manual Order on.
+    // disabled unless this is the viewer's own profile with Manual Order on
+    // (and, to avoid editing a half-loaded list, not while the list loads).
     if (fslot) {
       var btn = fslot.querySelector(".ra-edit-btn");
       if (!btn) {
@@ -797,36 +1447,39 @@
         btn.addEventListener("click", toggleEditMode);
         fslot.appendChild(btn);
       }
-      btn.disabled = !active;
-      btn.textContent = editing ? "Finish Editing" : "Edit Badges";
+      btn.disabled = !active || (beatenExtra.state === "loading" && !editing);
+      btn.textContent = editing ? "Save" : "Edit Badges";
     }
 
-    // Beaten section: "Finish Editing" (only while editing).
-    var sslot = null;
-    if (bLabel) {
-      sslot = bLabel.querySelector(".ra-edit-slot");
-      if (active && editing && !sslot) {
-        sslot = document.createElement("span");
-        sslot.className = "ra-edit-slot";
-        bLabel.appendChild(sslot);
+    // Beaten section: the Reset / Discard / Save bar (only while editing).
+    var section = bLabel ? bLabel.parentNode : null;
+    var bar = section ? section.querySelector(".ra-edit-bar") : null;
+    if (active && editing) {
+      if (!bar && section) {
+        var g = section.querySelector(".ra-beaten-grid");
+        if (g) section.insertBefore(buildEditBar(), g);
       }
+    } else if (bar && bar.parentNode) {
+      bar.parentNode.removeChild(bar);
     }
-    setSlotButton(sslot, active && editing, "Finish Editing");
+    updateSyncUI();
   }
 
   // Re-syncs the footer widgets with STORE (after import / storage changes).
   function syncFooterControls() {
     var sel = document.querySelector(".ra-footer-sort-select");
     if (sel) sel.value = getSortPref();
+    // A slider the user is dragging right now is the source of truth — never
+    // overwrite it from storage.
     var size = document.querySelector(".ra-footer-size .ra-range");
-    if (size) {
+    if (size && !size.hasAttribute("data-dragging")) {
       size.value = String(getBeatenSize());
       syncRangeFill(size);
       var lbl = size.parentNode.querySelector(".ra-range-value");
       if (lbl) lbl.textContent = getBeatenSize() + "%";
     }
     var color = document.querySelector(".ra-footer-color .ra-range");
-    if (color) {
+    if (color && !color.hasAttribute("data-dragging")) {
       color.value = String(getBeatenColor());
       syncRangeFill(color);
       var lbl2 = color.parentNode.querySelector(".ra-range-value");
@@ -872,13 +1525,14 @@
     document.body.style.paddingBottom = h + "px";
   }
 
+  // Returns true when the settings rows were added by this call.
   function injectFooterSettings() {
-    if (document.querySelector(".ra-footer-sort")) return;
+    if (document.querySelector(".ra-footer-sort")) return false;
     var themeSelect = document.querySelector("[data-choose-theme]");
-    if (!themeSelect) return;
+    if (!themeSelect) return false;
     var themeRow = themeSelect.closest(".flex.mb-3.items-center") ||
                    themeSelect.closest(".flex.items-center");
-    if (!themeRow || !themeRow.parentNode) return;
+    if (!themeRow || !themeRow.parentNode) return false;
 
     // --- Beaten Sort row ---
     var sortRow = buildFooterRow("ra-footer-sort");
@@ -908,12 +1562,14 @@
     // --- Beaten Size row (50% – 100% of full size) ---
     var sizeRow = buildRangeRow("ra-footer-size", "Beaten Size", "Beaten badge size", 50, 100, 5,
       getBeatenSize(),
-      function (v) { setRangePref(SIZE_KEY, v); applyBeatenStyles(); });
+      function (v) { STORE[SIZE_KEY] = String(v); applyBeatenStyles(); },   // live, while dragging
+      function (v) { setRangePref(SIZE_KEY, v); });                          // saved on release
 
     // --- Beaten Color row (0 = full grayscale, 100 = full color) ---
     var colorRow = buildRangeRow("ra-footer-color", "Beaten Color", "Beaten badge color", 0, 100, 5,
       getBeatenColor(),
-      function (v) { setRangePref(COLOR_KEY, v); applyBeatenStyles(); });
+      function (v) { STORE[COLOR_KEY] = String(v); applyBeatenStyles(); },
+      function (v) { setRangePref(COLOR_KEY, v); });
 
     // --- Manual Order row (own profile; only while logged in) ---
     var manualRow = null;
@@ -933,6 +1589,21 @@
       slot.className = "ra-edit-slot";
       manualRow.controls.appendChild(slot);
     }
+
+    // --- Beaten Data row (reload the full beaten list) ---
+    var dataRow = buildFooterRow("ra-footer-data");
+    dataRow.label.textContent = "Beaten Data";
+    dataRow.row.title = "Loads every beaten game from your progress pages, not only the ones in Completion Progress";
+    var syncBtn = document.createElement("button");
+    syncBtn.type = "button";
+    syncBtn.className = "btn-base btn-base--default btn-base--size-sm ra-sync-btn";
+    syncBtn.textContent = "Sync";
+    syncBtn.disabled = true;
+    syncBtn.addEventListener("click", function () { startSync(true); });
+    var syncStatus = document.createElement("span");
+    syncStatus.className = "ra-sync-status";
+    dataRow.controls.appendChild(syncBtn);
+    dataRow.controls.appendChild(syncStatus);
 
     // --- Backup row (Export / Import settings as JSON) ---
     var backupRow = buildFooterRow("ra-footer-backup");
@@ -969,14 +1640,18 @@
     parent.insertBefore(sizeRow, sortRow.row.nextSibling);
     parent.insertBefore(colorRow, sizeRow.nextSibling);
     if (manualRow) parent.insertBefore(manualRow.row, colorRow.nextSibling);
-    parent.insertBefore(backupRow.row,
-      manualRow ? manualRow.row.nextSibling : colorRow.nextSibling);
+    var afterManual = manualRow ? manualRow.row : colorRow;
+    parent.insertBefore(dataRow.row, afterManual.nextSibling);
+    parent.insertBefore(backupRow.row, dataRow.row.nextSibling);
 
     fixFooterHeight();
     if (!resizeBound) {
       resizeBound = true;
       window.addEventListener("resize", fixFooterHeight);
+      window.addEventListener("load", fixFooterHeight);
     }
+    updateSyncUI();
+    return true;
   }
   var resizeBound = false;
 
@@ -1197,41 +1872,101 @@
     }
   }
 
+  // Footer / popup button: starts editing, or saves when already editing.
   function toggleEditMode() {
     var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
-    var awards = document.getElementById("gameawards");
-    if (!grid || !awards) return;
+    if (grid && grid.classList.contains("ra-editing")) { saveEditMode(); return; }
+    startEditMode();
+  }
 
-    if (grid.classList.contains("ra-editing")) {
-      // FINISH — persist the arrangement shown in the grid.
-      var order = [], hidden = [];
-      var tiles = grid.querySelectorAll("[data-beaten]");
-      for (var i = 0; i < tiles.length; i++) {
-        var id = tiles[i].getAttribute("data-gameid");
-        if (tiles[i].classList.contains("ra-hidden")) hidden.push(id);
-        else order.push(id);
-      }
-      grid.classList.remove("ra-editing"); // exit edit mode (unblocks refresh)
-      setManualData(getUsername(), { order: order, hidden: hidden });
-      refreshBeatenSection(); // re-renders in normal (saved) view
-    } else {
-      var ctx = buildContext();
-      var beaten = getBeatenGames(computeMasteredIds(awards));
-      var split = applyManualOrder(beaten, ctx.manual || { order: [], hidden: [] });
-      enterEditMode(grid, split.hiddenGames, ctx.username);
-      updateFooterEditButton();
-      // Entering edit mode is usually triggered from the footer or the
-      // toolbar popup — both far below the badges. Bring the beaten section
-      // (its counters carry the "Finish Editing" button) into view so
-      // editing can start right away.
-      var sec = null;
-      try { sec = grid.closest(".ra-beaten-section"); } catch (e) {}
-      if (!sec) sec = document.querySelector("#gameawards .ra-beaten-section");
-      if (sec) {
-        try { sec.scrollIntoView({ behavior: "smooth", block: "start" }); }
-        catch (e) { try { sec.scrollIntoView(); } catch (e2) {} }
-      }
+  // SAVE — persist the arrangement shown in the grid.
+  function saveEditMode() {
+    var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
+    if (!grid || !grid.classList.contains("ra-editing")) return;
+    var order = [], hidden = [];
+    var tiles = grid.querySelectorAll("[data-beaten]");
+    for (var i = 0; i < tiles.length; i++) {
+      var id = tiles[i].getAttribute("data-gameid");
+      if (tiles[i].classList.contains("ra-hidden")) hidden.push(id);
+      else order.push(id);
     }
+    // Games that were saved earlier but aren't in the grid right now keep
+    // their place instead of being forgotten.
+    var prev = getManualData(getUsername());
+    if (prev) {
+      var present = Object.create(null);
+      order.concat(hidden).forEach(function (id) { present[id] = true; });
+      prev.order.forEach(function (id) { if (!present[id]) { present[id] = true; order.push(id); } });
+      prev.hidden.forEach(function (id) { if (!present[id]) { present[id] = true; hidden.push(id); } });
+    }
+    grid.classList.remove("ra-editing"); // exit edit mode (unblocks refresh)
+    setManualData(getUsername(), { order: order, hidden: hidden });
+    refreshBeatenSection(); // re-renders in normal (saved) view
+  }
+
+  // DISCARD — leave edit mode; the saved arrangement stays as it was.
+  function discardEditMode() {
+    var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
+    if (!grid || !grid.classList.contains("ra-editing")) return;
+    grid.classList.remove("ra-editing");
+    refreshBeatenSection();
+  }
+
+  // RESET — delete the saved arrangement (default order, nothing hidden).
+  function resetEditMode() {
+    var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
+    if (!grid || !grid.classList.contains("ra-editing")) return;
+    grid.classList.remove("ra-editing");
+    clearManualData(getUsername());
+    refreshBeatenSection();
+  }
+
+  // Height of a fixed/sticky bar stuck to the top of the viewport (RA's menu).
+  function stickyHeaderHeight() {
+    var h = 0;
+    try {
+      var els = document.querySelectorAll("header, nav, #app-header, .navbar");
+      for (var i = 0; i < els.length; i++) {
+        var cs = window.getComputedStyle(els[i]);
+        if (cs.position !== "fixed" && cs.position !== "sticky") continue;
+        var r = els[i].getBoundingClientRect();
+        if (r.top <= 2 && r.bottom > 0 && r.bottom < 220) h = Math.max(h, r.bottom);
+      }
+    } catch (e) {}
+    return h;
+  }
+
+  // Brings the Reset / Discard / Save bar into view (with the Beaten label
+  // just above it), clear of any sticky site menu. Entering edit mode is
+  // usually triggered from the footer or the toolbar popup, far below.
+  function scrollEditBarIntoView() {
+    var bar = document.querySelector("#gameawards .ra-edit-bar");
+    if (!bar) return;
+    function go(smooth) {
+      var top = bar.getBoundingClientRect().top + (window.pageYOffset || 0) -
+                stickyHeaderHeight() - 64;
+      try { window.scrollTo({ top: Math.max(0, top), behavior: smooth ? "smooth" : "auto" }); }
+      catch (e) { window.scrollTo(0, Math.max(0, top)); }
+    }
+    go(true);
+    // Layout can still shift while a smooth scroll runs (images, the grid
+    // growing) — check again and correct instantly if the bar isn't visible.
+    setTimeout(function () {
+      var r = bar.getBoundingClientRect();
+      if (r.top < stickyHeaderHeight() + 4 || r.bottom > (window.innerHeight || 0)) go(false);
+    }, 800);
+  }
+
+  function startEditMode() {
+    var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
+    var awards = document.getElementById("gameawards");
+    if (!grid || !awards || beatenExtra.state === "loading") return;
+    var ctx = buildContext();
+    var beaten = getAllBeaten(computeMasteredIds(awards));
+    var split = applyManualOrder(beaten, ctx.manual || { order: [], hidden: [] });
+    enterEditMode(grid, split.hiddenGames, ctx.username);
+    updateFooterEditButton();
+    scrollEditBarIntoView();
   }
 
   /* ---------- beaten section rendering -------------------------------- */
@@ -1272,13 +2007,13 @@
     var bLabel = buildGroupLabel("Beaten", false);
     var hcDisp = Math.max(hcTotal, hcF);
     if (hcDisp > 0) {
-      var hcHid = Math.max(0, hcDisp - hcV);
+      var hcHid = beatenExtra.state === "loading" ? 0 : Math.max(0, hcDisp - hcV);
       bLabel.appendChild(makeCrownCounter("silver", hcDisp,
         hcDisp + " games beaten" + (hcHid > 0 ? " (" + hcHid + " hidden)" : "")));
     }
     var scDisp = Math.max(scTotal, scF);
     if (scDisp > 0) {
-      var scHid = Math.max(0, scDisp - scV);
+      var scHid = beatenExtra.state === "loading" ? 0 : Math.max(0, scDisp - scV);
       bLabel.appendChild(makeMedalCounter(scDisp,
         scDisp + " games beaten (casual)" + (scHid > 0 ? " (" + scHid + " hidden)" : "")));
     }
@@ -1299,9 +2034,17 @@
 
   // (Re)builds the Beaten section inside `awards`. Safe to call repeatedly.
   function renderBeatenSection(awards, beaten, gridClass, withDivider, totals, ctx) {
+    // Build the new section first: if anything goes wrong the existing one
+    // stays on the page instead of the Beaten badges vanishing.
+    var section;
+    try {
+      section = buildBeatenSection(beaten, gridClass, withDivider, totals, ctx);
+    } catch (e) {
+      console.info("[RABG] Could not build the Beaten section:", e);
+      return null;
+    }
     var old = awards.querySelector(".ra-beaten-section");
     if (old && old.parentNode) old.parentNode.removeChild(old);
-    var section = buildBeatenSection(beaten, gridClass, withDivider, totals, ctx);
     if (withDivider) {
       var mGrid = awards.querySelector(".grid");
       if (mGrid && mGrid.parentNode) mGrid.parentNode.insertBefore(section, mGrid.nextSibling);
@@ -1318,11 +2061,14 @@
     if (document.querySelector(".ra-beaten-grid.ra-editing")) return;
     var awards = document.getElementById("gameawards");
     if (!awards || !awards.querySelector(".ra-beaten-section")) return;
-    var mGrid = awards.querySelector(".grid");
+    // The Mastered grid (not the Beaten one). Profiles without any Mastered
+    // badges have no Mastered label — and therefore no divider.
+    var mGrid = awards.querySelector(".grid:not(.ra-beaten-grid)");
+    var hasMastered = !!awards.querySelector(".ra-grouplabel-first");
     var ctx = buildContext();
-    var beaten = getBeatenGames(computeMasteredIds(awards));
+    var beaten = getAllBeaten(computeMasteredIds(awards));
     var totals = getBeatenTotals();
-    renderBeatenSection(awards, beaten, mGrid ? mGrid.className : GRID_CLASSES, true, totals, ctx);
+    renderBeatenSection(awards, beaten, mGrid ? mGrid.className : GRID_CLASSES, hasMastered, totals, ctx);
     updateFooterEditButton();
   }
 
@@ -1338,6 +2084,9 @@
     var beatenTotals = getBeatenTotals();
     var hasTotal = !!(beatenTotals && (beatenTotals.hc > 0 || beatenTotals.sc > 0));
     var created = false;
+    // Use the cached complete list if it is current, otherwise start loading it
+    // (the Beaten section is rendered right away and fills up as pages arrive).
+    maybeAutoSync();
 
     if (awards) {
       var grid = awards.querySelector(".grid");
@@ -1357,14 +2106,14 @@
         awards.insertBefore(mLabel, grid);
       }
 
-      var beaten = getBeatenGames(computeMasteredIds(awards));
+      var beaten = getAllBeaten(computeMasteredIds(awards));
       if (beaten.length > 0 || hasTotal) {
         renderBeatenSection(awards, beaten, grid.className, true, beatenTotals, ctx);
       }
 
       awards.dataset.raApplied = "v2";
     } else {
-      var beaten0 = getBeatenGames(Object.create(null));
+      var beaten0 = getAllBeaten(Object.create(null));
       if (beaten0.length === 0 && !hasTotal) return true;
       var completed = document.getElementById("completedgames");
       if (!completed || !completed.parentNode) return false;
@@ -1386,6 +2135,7 @@
       (ctx.manualActive ? " — manual order active" : "") +
       (created ? " — created the Game Awards box." : ".")
     );
+    updateSyncUI();
     return true;
   }
 
@@ -1537,7 +2287,7 @@
     rt.onMessage.addListener(function (msg, sender, respond) {
       if (!msg || typeof msg !== "object") return;
       var ctx = buildContext();
-      var ownProfile = !!(ctx.viewer && ctx.username && ctx.viewer === ctx.username) &&
+      var ownProfile = sameUser(ctx.viewer, ctx.username) &&
         !!document.querySelector("#gameawards .ra-beaten-section");
       if (msg.type === "rabg-get-state") {
         // `ownProfile` is stable regardless of the Manual Order toggle, so
@@ -1547,8 +2297,12 @@
           ok: true,
           ownProfile: ownProfile,
           manualActive: ctx.manualActive && ownProfile,
-          editing: !!document.querySelector(".ra-beaten-grid.ra-editing")
+          editing: !!document.querySelector(".ra-beaten-grid.ra-editing"),
+          sync: syncInfo()
         });
+      } else if (msg.type === "rabg-sync") {
+        startSync(true);
+        respond({ ok: true, ownProfile: ownProfile, sync: syncInfo() });
       } else if (msg.type === "rabg-open-import") {
         // Popups get destroyed by the native file dialog, and programmatic
         // file-input clicks need a real in-page gesture — so the popup asks
@@ -1563,7 +2317,8 @@
         respond({
           ok: true,
           ownProfile: ownProfile,
-          editing: !!document.querySelector(".ra-beaten-grid.ra-editing")
+          editing: !!document.querySelector(".ra-beaten-grid.ra-editing"),
+          sync: syncInfo()
         });
       }
     });
@@ -1585,7 +2340,13 @@
     if (observer) return;
     observer = new MutationObserver(function () {
       if (debounce) return;
-      debounce = setTimeout(function () { debounce = null; injectFooterSettings(); fixFooterHeight(); apply(); }, 300);
+      debounce = setTimeout(function () {
+        debounce = null;
+        // The footer is re-measured only when it was (re)built; the profile
+        // logic only ever runs on /user/<name> pages.
+        if (injectFooterSettings()) fixFooterHeight();
+        if (isProfilePage()) apply();
+      }, 300);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
@@ -1594,7 +2355,7 @@
     injectFooterSettings();
     captureSiteTheme();
     startThemeObserver();
-    var ok = apply();
+    var ok = isProfilePage() ? apply() : true;
     updateFooterEditButton(); // footer button exists (disabled) even off-profile
     if (ok) startObserver();
     else { scheduleRetry(); startObserver(); }

@@ -125,6 +125,12 @@ h1 {
 .row > span:first-child { white-space: nowrap; }
 
 .ctrl { display: flex; align-items: center; gap: 6px; }
+
+/* Sync status line (only shown when there is something to say). */
+.status-row[hidden] { display: none; }
+.status-row { margin-top: -4px; }
+.row.status-row > span:first-child { white-space: normal; }
+.status { font-size: 11px; color: var(--rabg-val, #8c8c8c); }
 .manual-ctrl { gap: 8px; }
 
 /* Select — mirrors RA's base select styling
