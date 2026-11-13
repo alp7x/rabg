@@ -96,6 +96,19 @@
   opacity: 0.8;
 }
 .ra-sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* A failed sync: red text that blinks once each time it fails. */
+.ra-sync-status.ra-sync-error,
+#gameawards .ra-loading.ra-sync-error {
+  color: #ef4444;
+  opacity: 1;
+}
+.ra-sync-blink { animation: ra-sync-blink 0.9s ease-out 1; }
+@keyframes ra-sync-blink {
+  0% { opacity: 0; }
+  25% { opacity: 1; }
+  50% { opacity: 0.25; }
+  100% { opacity: 1; }
+}
 
 /* ---- Footer slider rows ---- */
 /* Custom-drawn so Firefox and Chromium render IDENTICALLY: a 20px thumb

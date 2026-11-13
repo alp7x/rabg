@@ -1,0 +1,8 @@
+# Output of build.py (the store zips)
+dist/
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

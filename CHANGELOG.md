@@ -41,3 +41,16 @@
 - Fixed: a stray divider line could appear on profiles without Mastered badges after changing a setting.
 - The extension no longer does background work on pages other than profiles.
 - Various small clean-ups and improvements.
+
+# v1.4.1 (2026/11/13)
+- When your beaten totals change, RABG now reads only the newest page of your completion progress instead of every page. And if the numbers don't add up afterwards, it automatically does a full reload (The Sync button always does the full reload).
+- The badges you already had now stay on screen while the list is refreshed, instead of the Beaten section emptying and filling up from scratch again.
+- The newest page of the completion progress is now checked quietly every time you open a profile, so Percentage and Last Unlock sorts stay up to date even if your beaten totals didn't change (e.g. when earning more achievements in a game you had already beaten).
+- While editing the Manual Order, the page now auto-scrolls when you hold a badge near the top or bottom edge of the window, so badges can be moved across more easily on a long list.
+- Sync is now more reliable. A page that fails to load is retried automatically ("retrying" is shown), being offline is reported right away instead of staying on "Loading…", and a failed sync is shown in red.
+- RABG is now faster on big profiles. A refresh that brings nothing new doesn't redraw the entire Beaten section.
+- Remembered lists take up less storage. If the browser's storage for the extension ever fills up, older remembered lists are dropped automatically.
+- Fixed: while dragging, a badge could not be moved back to the place it started from (the preview didn't go there).
+- Fixed: a badge dragged while the page was scrolling (e.g. with the mouse wheel) could land in the wrong place.
+- Fixed: games with almost identical percentages could be ordered slightly differently after a reload.
+- Accessibility: Screen readers now announce the RABG settings and the badge links by name.

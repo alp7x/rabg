@@ -30,12 +30,12 @@
  * - Creates a Game Awards box for profiles that have none.
  * - Games already mastered are excluded from Beaten.
  * - Complete beaten list: the profile's Completion Progress only lists the
- *   games with the highest completion %, so when the true beaten total is
- *   larger the script reads the user's progress pages (filtered to "beaten",
- *   100 games per page) in the background, shows games as they arrive and
- *   caches the result per profile (refreshed when the beaten totals change,
- *   or via the Sync button). The same pages carry time-to-beat and the
- *   last-unlock date, which power the extra sort options.
+ *   games with the highest completion %, so the Beaten section is always
+ *   built from the user's progress pages (filtered to "beaten", 100 games
+ *   per page): read in the background, shown as they arrive and cached per
+ *   profile (refreshed when the beaten totals change, or via the Sync
+ *   button). The same pages carry time-to-beat and the last-unlock date,
+ *   which power the extra sort options.
  */
 (function () {
   "use strict";
@@ -52,11 +52,15 @@
   var POPUP_THEME_KEY = "rabg-popup-theme";
   var CACHE_PREFIX = "rabg-cache-";            // + lowercased username → complete beaten list
   var CACHE_INDEX_KEY = "rabg-cache-index";    // LRU list of cached usernames
-  var CACHE_VERSION = 1;
+  var CACHE_VERSION = 2;           // written as 2 (short image form); 1 (v1.4.0) is still readable
   var FLASH_MS = 4000;             // how long "Synced ✓" stays next to the Beaten label
   var CACHE_MAX_PROFILES = 20;     // other people's profiles (your own never counts)
   var SYNC_PAGE_DELAY_MS = 400;                // politeness delay between progress pages
   var SYNC_MAX_PAGES = 60;                     // safety cap (6,000 beaten games)
+  var SYNC_RETRIES = 2;                        // extra attempts per page after a network/server hiccup
+  var SYNC_RETRY_DELAY_MS = 1500;              // wait before retry 1 (doubled for retry 2)
+  var SYNC_TIMEOUT_MS = 20000;                 // give up on a page that doesn't answer
+  var QUICK_MAX_PAGES = 3;                     // quick refresh: newest pages looked at before a full reload
   var LEGACY_KEYS = [SORT_KEY, SIZE_KEY, COLOR_KEY];
   var GRID_CLASSES =
     "component w-full place-content-center bg-embed gap-2 grid " +
@@ -95,13 +99,16 @@
     catch (e) { finish({}); }
   }
 
-  function storageSetItems(area, obj) {
+  // `onFail` (optional) runs when the browser refuses the write (storage full).
+  function storageSetItems(area, obj, onFail) {
+    function failed(err) {
+      console.info("[RABG] storage write failed:", err);
+      if (onFail) { try { onFail(err); } catch (e2) {} }
+    }
     try {
       var p = area.set(obj);
-      if (p && typeof p.catch === "function") {
-        p.catch(function (err) { console.info("[RABG] storage write failed:", err); });
-      }
-    } catch (e) { console.info("[RABG] storage write failed:", e); }
+      if (p && typeof p.catch === "function") p.catch(failed);
+    } catch (e) { failed(e); }
   }
 
   function persistStore() {
@@ -112,12 +119,12 @@
     }
   }
 
-  function storeSet(key, value) {
+  function storeSet(key, value, onFail) {
     STORE[key] = value;
     if (usingExtStorage) {
       var obj = {};
       obj[key] = value;
-      storageSetItems(getStorageApi().local, obj);
+      storageSetItems(getStorageApi().local, obj, onFail);
     } else {
       persistStore();
     }
@@ -178,18 +185,33 @@
     }
   }
 
-  // Keeps other tabs (and, later, the popup) in sync.
+  function sameValue(a, b) {
+    if (a === b) return true;
+    try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return false; }
+  }
+
+  // Keeps this page in sync with changes made in the popup or in other tabs.
+  // Every write this page makes itself also comes back through here (the
+  // "echo"); those carry nothing new — the page was already updated when the
+  // value was set — so they are skipped instead of redrawing everything twice.
   function startStorageListener() {
     var storage = getStorageApi();
     if (!storage || !storage.onChanged || !storage.onChanged.addListener) return;
     storage.onChanged.addListener(function (changes, area) {
       if (area && area !== "local") return;
-      var structural = false;
+      var structural = false, changed = false;
       for (var key in changes) {
-        STORE[key] = changes[key].newValue;
+        var nv = changes[key].newValue;
+        var isCache = key === CACHE_INDEX_KEY || key.indexOf(CACHE_PREFIX) === 0;
+        if (!isCache && sameValue(STORE[key], nv)) continue;   // our own write, echoed back
+        if (nv === undefined) delete STORE[key];
+        else STORE[key] = nv;
+        if (isCache) continue;   // cached lists never change what is on screen
+        changed = true;
         if (key === SORT_KEY || key === MANUAL_ENABLED_KEY ||
             key.indexOf(MANUAL_KEY_PREFIX) === 0) structural = true;
       }
+      if (!changed) return;
       // Turning Manual Order off (from the popup or another tab) must also
       // exit an in-progress edit mode on this page.
       if (changes[MANUAL_ENABLED_KEY] && changes[MANUAL_ENABLED_KEY].newValue !== "1") {
@@ -200,6 +222,7 @@
       if (structural) {
         refreshBeatenSection();
       }
+      if (changes[SORT_KEY]) maybeQuickCheck();
     });
   }
 
@@ -404,6 +427,10 @@
     return 0;
   }
 
+  // Completion is kept to 4 decimals everywhere (tiles, cache, sorting), so
+  // a freshly loaded list and a cached one always sort identically.
+  function round4(n) { return Math.round((+n || 0) * 10000) / 10000; }
+
   /* ---------- RA page data -------------------------------------------- */
 
   function readMasteryCounts(awards) {
@@ -495,7 +522,7 @@
       var gameId = m[1];
       if (excludeIds && excludeIds[gameId]) continue;
 
-      var pct = completionOf(tr);
+      var pct = round4(completionOf(tr));
       if (map[gameId]) {
         if (pct > map[gameId].pct) map[gameId].pct = pct;
         continue;
@@ -531,36 +558,52 @@
 
   function isProfilePage() { return /^\/user\/[^\/]+\/?$/.test(location.pathname); }
 
-  var MONTHS = {
-    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6,
-    august: 7, september: 8, october: 9, november: 10, december: 11
-  };
-  var DURATION_UNITS = {
-    second: 1, minute: 60, hour: 3600, day: 86400, week: 604800,
-    month: 2592000, year: 31536000
+  var MONTHS = {   // by the first three letters ("October", "Oct", "Oct.")
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6,
+    aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
   };
 
   function cleanText(el) { return (el.textContent || "").replace(/\s+/g, " ").trim(); }
   function isSafeImg(src) { return typeof src === "string" && /^(https:\/\/|\/)[^\s"'<>]+$/.test(src); }
 
-  // "34 hours, 52 minutes" → seconds (null if nothing recognizable).
+  function unitSeconds(u) {
+    u = u.toLowerCase();
+    if (u.indexOf("mo") === 0) return 2592000;
+    if (u.charAt(0) === "s") return 1;
+    if (u.charAt(0) === "m") return 60;
+    if (u.charAt(0) === "h") return 3600;
+    if (u.charAt(0) === "d") return 86400;
+    if (u.charAt(0) === "w") return 604800;
+    return 31536000; // y
+  }
+
+  // "34 hours, 52 minutes" (also "34h 52m", "34 hrs 52 mins") → seconds;
+  // null if nothing recognizable.
   function parseDuration(text) {
-    var re = /(\d[\d,]*)\s*(second|minute|hour|day|week|month|year)s?/gi;
+    var re = /(\d[\d,]*)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|yrs?|[smhdwy])(?![a-z])/gi;
     var m, total = 0, found = false;
     while ((m = re.exec(text))) {
       found = true;
-      total += parseInt(m[1].replace(/,/g, ""), 10) * DURATION_UNITS[m[2].toLowerCase()];
+      total += parseInt(m[1].replace(/,/g, ""), 10) * unitSeconds(m[2]);
     }
     return found ? total : null;
   }
 
-  // "October 19 2026" → UTC timestamp (null if it isn't a date).
+  // "October 19 2026" (also "Oct 19, 2026" or "19 October 2026") → UTC
+  // timestamp; null if it isn't a date.
   function parseDateText(text) {
-    var m = /^([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})$/.exec(text);
-    if (!m) return null;
-    var mon = MONTHS[m[1].toLowerCase()];
-    if (mon === undefined) return null;
-    return Date.UTC(parseInt(m[3], 10), mon, parseInt(m[2], 10));
+    var day, monName, year;
+    var m = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/.exec(text);
+    if (m) { monName = m[1]; day = m[2]; year = m[3]; }
+    else {
+      m = /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(text);
+      if (!m) return null;
+      day = m[1]; monName = m[2]; year = m[3];
+    }
+    var mon = MONTHS[monName.toLowerCase().slice(0, 3)];
+    var d = parseInt(day, 10);
+    if (mon === undefined || d < 1 || d > 31) return null;
+    return Date.UTC(parseInt(year, 10), mon, d);
   }
 
   // Reads one progress page (already parsed into a document).
@@ -606,7 +649,7 @@
       if (!pct) pct = completionOf(li);
 
       games.push({
-        gameId: m[1], imgSrc: src, pct: pct, type: type,
+        gameId: m[1], imgSrc: src, pct: round4(pct), type: type,
         title: cleanText(link), ttb: ttb, unl: unl
       });
     }
@@ -625,23 +668,53 @@
       "/progress?filter%5Bstatus%5D=any-beaten" +
       (useSort ? "&sort=game_title" : "") +        // stable order across pages
       "&page%5Bnumber%5D=" + page;
-    return fetch(url, { credentials: "same-origin", cache: "no-store" })
+    var opts = { credentials: "same-origin", cache: "no-store" };
+    // A page that never answers must not leave the sync stuck on "Loading…".
+    var ctrl = null, timer = null, timedOut = false;
+    if (typeof AbortController === "function") {
+      ctrl = new AbortController();
+      opts.signal = ctrl.signal;
+      timer = setTimeout(function () { timedOut = true; try { ctrl.abort(); } catch (e) {} }, SYNC_TIMEOUT_MS);
+    }
+    function settle() { if (timer) { clearTimeout(timer); timer = null; } }
+    return fetch(url, opts)
       .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
+        if (!r.ok) {
+          var err = new Error("HTTP " + r.status);
+          err.status = r.status;
+          throw err;
+        }
         return r.text();
       })
       .then(function (html) {
+        settle();
         return parseProgressDoc(new DOMParser().parseFromString(html, "text/html"));
+      }, function (err) {
+        settle();
+        if (timedOut) { err = new Error("timed out"); err.timedOut = true; }
+        throw err;
       });
   }
 
-  /* --- cache (storage.local, one entry per profile, LRU of 10) --- */
+  /* --- cache (storage.local, one entry per profile; see CACHE_MAX_PROFILES) --- */
 
   function cacheKeyFor(user) { return CACHE_PREFIX + String(user).toLowerCase(); }
 
+  // Badge images all live at the same address on RA's media server, so only
+  // the file number is stored ("085573"); anything else is stored in full.
+  var IMG_PREFIX = "https://media.retroachievements.org/Images/";
+  var IMG_SUFFIX = ".png";
+  function packImg(src) {
+    var m = /^https:\/\/media\.retroachievements\.org\/Images\/(\d+)\.png$/.exec(src || "");
+    return m ? m[1] : src;
+  }
+  function unpackImg(v) {
+    return (typeof v === "string" && /^\d+$/.test(v)) ? IMG_PREFIX + v + IMG_SUFFIX : v;
+  }
+
   // Compact on-disk form: [id, title, img, pct, hardcore(1/0), ttb, unl]
   function packGame(g) {
-    return [g.gameId, g.title, g.imgSrc, Math.round(g.pct * 10000) / 10000,
+    return [g.gameId, g.title, packImg(g.imgSrc), round4(g.pct),
             g.type === "hc" ? 1 : 0,
             typeof g.ttb === "number" ? g.ttb : null,
             typeof g.unl === "number" ? g.unl : null];
@@ -649,9 +722,10 @@
   function unpackGame(a) {
     if (!Array.isArray(a) || a.length < 7) return null;
     var id = String(a[0]);
-    if (!/^\d+$/.test(id) || !isSafeImg(a[2])) return null;
+    var img = unpackImg(a[2]);
+    if (!/^\d+$/.test(id) || !isSafeImg(img)) return null;
     return {
-      gameId: id, title: String(a[1] || ""), imgSrc: a[2], pct: +a[3] || 0,
+      gameId: id, title: String(a[1] || ""), imgSrc: img, pct: round4(a[3]),
       type: a[4] ? "hc" : "sc",
       ttb: typeof a[5] === "number" ? a[5] : null,
       unl: typeof a[6] === "number" ? a[6] : null
@@ -660,7 +734,7 @@
 
   function readCache(user) {
     var c = STORE[cacheKeyFor(user)];
-    if (!c || typeof c !== "object" || c.v !== CACHE_VERSION ||
+    if (!c || typeof c !== "object" || (c.v !== CACHE_VERSION && c.v !== 1) ||
         typeof c.sig !== "string" || !Array.isArray(c.g)) return null;
     var games = Object.create(null), n = 0;
     for (var i = 0; i < c.g.length; i++) {
@@ -674,7 +748,20 @@
     var lower = String(user).toLowerCase();
     var arr = [];
     for (var id in games) arr.push(packGame(games[id]));
-    storeSet(cacheKeyFor(lower), { v: CACHE_VERSION, sig: sig, t: Date.now(), g: arr });
+    var entry = { v: CACHE_VERSION, sig: sig, t: Date.now(), g: arr };
+    storeSet(cacheKeyFor(lower), entry, function () {
+      // The browser refused the write — most likely the extension's storage
+      // is full. Drop every other remembered list and try once more.
+      var me0 = String(getViewerUsername() || "").toLowerCase();
+      var list = Array.isArray(STORE[CACHE_INDEX_KEY]) ? STORE[CACHE_INDEX_KEY] : [];
+      var keep = [];
+      for (var j = 0; j < list.length; j++) {
+        if (list[j] === lower || list[j] === me0) keep.push(list[j]);
+        else storeRemove(CACHE_PREFIX + list[j]);
+      }
+      storeSet(CACHE_INDEX_KEY, keep);
+      storeSet(cacheKeyFor(lower), entry);
+    });
     var idx = Array.isArray(STORE[CACHE_INDEX_KEY]) ? STORE[CACHE_INDEX_KEY].slice() : [];
     idx = idx.filter(function (u) { return u !== lower; });
     idx.push(lower);
@@ -756,7 +843,7 @@
                    title: e.title, ttb: e.ttb, unl: e.unl });
       }
     }
-    if (!out.length && beatenExtra.state !== "loading") return getBeatenGames(excludeIds);
+    if (!out.length && beatenExtra.state !== "loading") out = getBeatenGames(excludeIds);
     return sortGames(out, getSortPref());
   }
 
@@ -769,72 +856,213 @@
     return out;
   }
 
-  // Fetches every page of the user's beaten list, refreshing the Beaten
-  // section after each one. `manual` = the Sync button (shows a confirmation
-  // when it is done, because the list often looks the same afterwards).
-  function startSync(manual) {
+  // Fetches every page of the user's beaten list. `manual` = the Sync button
+  // (shows a confirmation when it is done, because the list often looks the
+  // same afterwards).
+  //
+  // While the pages load, the list that is already known for this profile
+  // (the one on screen, or an older remembered one) stays visible, so a
+  // refresh never empties the section; it is swapped for the new list at the
+  // end. Without any known list the section fills up page by page.
+  //
+  // `check` = a silent look at the newest page only (see maybeQuickCheck): it
+  // shows nothing unless it finds a change, and never reports an error.
+  function startSync(manual, check) {
     if (!isProfilePage() || beatenExtra.state === "loading") return false;
     var user = getUsername();
     if (!user || typeof fetch !== "function") return false;
     var sig = currentSig(getBeatenTotals());
     var token = ++syncToken;
     var lower = user.toLowerCase();
-    // Keep showing older data of the same profile while the new data loads.
     var previous = beatenExtra.user === lower ? beatenExtra.games : null;
+    var fromStale = false;
+    if (!previous) {                     // an older remembered list is better than nothing
+      var stale = readCache(lower);
+      if (stale && stale.count) { previous = stale.games; fromStale = true; }
+    }
     var fresh = Object.create(null);
-    var page = 1, useSort = true;
-    beatenExtra = { user: lower, sig: sig, games: previous,
-                    state: "loading", loaded: 0, total: 0, at: 0, error: "", flashUntil: 0 };
-    updateSyncUI();
-    if (previous) refreshBeatenSection();
+    var page = 1, useSort = true, attempts = 0, pageSize = 0, probing = false;
+    // Quick refresh (automatic refreshes only, when an older list of this
+    // profile is remembered): RA's progress page lists games by their latest
+    // unlock, newest first, and beating a game IS an unlock — so new or
+    // changed games sit at the top. Read from the top until a game shows up
+    // that is exactly as remembered, merge, and accept the result only if the
+    // number of games then equals RA's own count. Anything else (a game
+    // missing, one too many, an error) falls back to the full reload below.
+    // The Sync button always does the full reload.
+    var silent = !!check && !manual && !fromStale && !!previous && beatenExtra.state === "done";
+    if (check && !silent) return false;
+    var quick = !manual && (fromStale || silent);
+    var merged = null, changedAny = false;
+    quickChecked = lower;                // any sync covers the "is it current?" check
+    function showLoading() {
+      beatenExtra = { user: lower, sig: sig, games: previous,
+                      state: "loading", loaded: 0, total: 0, at: 0, error: "", flashUntil: 0 };
+      if (fromStale) refreshBeatenSection(); // show it right away (no-op before the first render)
+      updateFooterEditButton();            // also refreshes the Sync row / hint
+    }
+    if (!silent) showLoading();
 
     function fail(err) {
       if (token !== syncToken) return;
+      if (silent) return;                  // the list on screen stays as it is
       console.info("[RABG] Sync failed on page " + page + ":", err);
+      beatenExtra.retrying = false;
       beatenExtra.state = "error";
       beatenExtra.error = String((err && err.message) || err).slice(0, 60);
       beatenExtra.games = unionMaps(fresh, previous);
       refreshBeatenSection();
+      updateFooterEditButton();
+      flashSyncError();
+    }
+
+    function finish() {
+      if (token !== syncToken) return;
+      beatenExtra.games = fresh;
+      beatenExtra.loaded = countKeys(fresh);
+      beatenExtra.state = "done";
+      beatenExtra.retrying = false;
+      beatenExtra.at = Date.now();
+      if (manual) beatenExtra.flashUntil = Date.now() + FLASH_MS;
+      if (sig) writeCache(user, sig, fresh);
+      console.info("[RABG] Synced " + beatenExtra.loaded + " beaten games in " + page + " page(s).");
+      refreshBeatenSection();
+      updateFooterEditButton();
+    }
+
+    function onPage(res) {
+      if (token !== syncToken) return;
+      if (!res.games.length && page === 1) {
+        if (useSort) { useSort = false; step(); return; }   // retry once without the sort hint
+        fail(new Error("no games found on the progress page"));
+        return;
+      }
+      attempts = 0;
+      beatenExtra.retrying = false;
+      var added = 0, novel = false;
+      for (var i = 0; i < res.games.length; i++) {
+        var g = res.games[i];
+        if (!fresh[g.gameId]) {
+          fresh[g.gameId] = g;
+          added++;
+          if (!previous || !previous[g.gameId]) novel = true;
+        }
+      }
+      if (page === 1) pageSize = res.games.length;
+      if (res.total !== null && !beatenExtra.total) beatenExtra.total = res.total;
+      beatenExtra.loaded = countKeys(fresh);
+      var complete = !!beatenExtra.total && beatenExtra.loaded >= beatenExtra.total;
+      // Normally the "Next" link says whether more pages follow. If it is
+      // missing although the page was full and RA's own count says there are
+      // more games, look at the next page anyway (once) — otherwise a small
+      // change to RA's page layout would silently cut the list short.
+      probing = !res.hasNext && !complete && added > 0 && !!beatenExtra.total &&
+                pageSize > 0 && res.games.length >= pageSize;
+      if (added === 0 || page >= SYNC_MAX_PAGES || complete || (!res.hasNext && !probing)) {
+        finish();
+        return;
+      }
+      beatenExtra.games = unionMaps(fresh, previous);
+      // Redraw only when this page brought games that weren't on screen yet:
+      // after every page at first, for very large lists only every third page
+      // (the final result is always drawn by finish()).
+      if (novel && (page <= 5 || page % 3 === 0)) refreshBeatenSection();
       updateSyncUI();
+      page++;
+      setTimeout(step, SYNC_PAGE_DELAY_MS);
+    }
+
+    function fullReload() {
+      if (silent) { silent = false; showLoading(); }
+      quick = false;
+      merged = null;
+      fresh = Object.create(null);
+      page = 1; attempts = 0;
+      beatenExtra.loaded = 0; beatenExtra.total = 0;
+      updateSyncUI();
+      step();
+    }
+
+    function sameGame(a, b) {
+      return a.unl === b.unl && a.pct === b.pct && a.ttb === b.ttb && a.type === b.type;
+    }
+
+    function onQuickPage(res) {
+      if (token !== syncToken) return;
+      if (!res.games.length || res.total === null) {
+        if (!silent) fullReload();       // unreadable page: a silent check just gives up
+        return;
+      }
+      if (!merged) merged = unionMaps(previous, null);
+      var sawKnown = false;
+      for (var i = 0; i < res.games.length; i++) {
+        var g = res.games[i], old = previous[g.gameId];
+        if (old && sameGame(old, g)) sawKnown = true;
+        else changedAny = true;
+        merged[g.gameId] = g;
+      }
+      if (!silent) beatenExtra.total = res.total;
+      if (sawKnown || !res.hasNext) {
+        var n = countKeys(merged);
+        if (silent && !changedAny) return;           // everything is as remembered
+        // A silent check started from a list that was complete, so "no game
+        // added" is good enough there even if RA counts differently.
+        if (n === res.total || (silent && n === countKeys(previous))) {
+          fresh = merged;
+          console.info("[RABG] Quick refresh: " + page + " page(s) were enough.");
+          finish();
+        } else {
+          fullReload();   // the numbers don't add up — read everything
+        }
+        return;
+      }
+      if (page >= QUICK_MAX_PAGES) { fullReload(); return; }
+      page++;
+      setTimeout(step, SYNC_PAGE_DELAY_MS);
+    }
+
+    function onFetchError(err) {
+      if (token !== syncToken) return;
+      if (silent) return;                                   // a silent check just gives up
+      if (quick) { fullReload(); return; }
+      if (probing) { page--; finish(); return; }            // there was no further page after all
+      var st = err && err.status;
+      if (st && page === 1 && useSort && !countKeys(fresh)) { // the server rejected it: retry once without the sort hint
+        useSort = false;
+        step();
+        return;
+      }
+      // A network hiccup, a timeout, "too many requests" or a server error is
+      // worth another try (a timeout only one — each already took a while);
+      // anything else (e.g. 404) is not.
+      var limit = err && err.timedOut ? 1 : SYNC_RETRIES;
+      if ((!st || st === 429 || st >= 500) && attempts < limit) {
+        attempts++;
+        beatenExtra.retrying = true;
+        updateSyncUI();
+        setTimeout(step, SYNC_RETRY_DELAY_MS * attempts);
+        return;
+      }
+      fail(err);
     }
 
     function step() {
       if (token !== syncToken) return;
-      fetchProgressPage(user, page, useSort).then(function (res) {
-        if (token !== syncToken) return;
-        if (!res.games.length && page === 1) throw new Error("no games found on the progress page");
-        var added = 0;
-        for (var i = 0; i < res.games.length; i++) {
-          var g = res.games[i];
-          if (!fresh[g.gameId]) { fresh[g.gameId] = g; added++; }
-        }
-        if (res.total !== null && !beatenExtra.total) beatenExtra.total = res.total;
-        beatenExtra.loaded = countKeys(fresh);
-        var finished = !res.hasNext || added === 0 || page >= SYNC_MAX_PAGES ||
-          (beatenExtra.total && beatenExtra.loaded >= beatenExtra.total);
-        if (finished) {
-          beatenExtra.games = fresh;
-          beatenExtra.state = "done";
-          beatenExtra.at = Date.now();
-          if (manual) beatenExtra.flashUntil = Date.now() + FLASH_MS;
-          if (sig) writeCache(user, sig, fresh);
-          console.info("[RABG] Synced " + beatenExtra.loaded + " beaten games in " + page + " page(s).");
-        } else {
-          beatenExtra.games = unionMaps(fresh, previous);
-        }
-        // Re-render after every page at first; for very large lists only every
-        // third page (the final result is always rendered).
-        if (finished || page <= 5 || page % 3 === 0) refreshBeatenSection();
-        updateSyncUI();
-        if (!finished) { page++; setTimeout(step, SYNC_PAGE_DELAY_MS); }
-      }).catch(function (err) {
-        if (page === 1 && useSort && !countKeys(fresh)) {  // retry once without the sort hint
-          useSort = false;
-          step();
-          return;
-        }
-        fail(err);
-      });
+      // No connection at all: say so right away instead of waiting for
+      // requests that can never be answered.
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        var off = new Error("you are offline");
+        // After a press on Sync, leave "Loading…" up for a moment — an error
+        // that replaces it instantly looks as if the button did nothing.
+        if (manual) setTimeout(function () { fail(off); }, 700);
+        else fail(off);
+        return;
+      }
+      // Errors inside onPage (our own code) go straight to fail(), never to
+      // the retry logic. The quick refresh uses RA's default order (latest
+      // unlock first), i.e. no sort parameter.
+      fetchProgressPage(user, page, quick ? false : useSort)
+        .then(quick ? onQuickPage : onPage, onFetchError).catch(fail);
     }
     step();
     return true;
@@ -853,8 +1081,26 @@
     prepareBeatenData(totals);                          // adopts a current cache
     if (beatenExtra.state === "loading") return;
     if (beatenExtra.user === user && beatenExtra.sig === sig &&
-        (beatenExtra.state === "done" || beatenExtra.state === "error")) return; // error: retry = Sync button
+        (beatenExtra.state === "done" || beatenExtra.state === "error")) { // error: retry = Sync button
+      maybeQuickCheck();
+      return;
+    }
     startSync(false);
+  }
+
+  // The remembered list is used while the beaten totals stay the same — but
+  // a lot can change without touching those totals: more achievements in an
+  // already-beaten game (percentage, last unlock), or a beaten game getting
+  // mastered on the same day another one is beaten. So the newest progress
+  // page is checked once on every profile visit (one request, silent). New
+  // and changed games are at its top; if a game was added or left, the count
+  // no longer fits and the full list is reloaded.
+  var quickChecked = "";
+  function maybeQuickCheck() {
+    if (!isProfilePage() || beatenExtra.state !== "done") return;
+    var user = getUsername().toLowerCase();
+    if (!user || beatenExtra.user !== user || quickChecked === user) return;
+    startSync(false, true);
   }
 
   function formatSyncTime(t) {
@@ -867,7 +1113,10 @@
 
   function syncStatusText() {
     var s = beatenExtra;
-    if (s.state === "loading") return "Loading beaten games… " + s.loaded + (s.total ? "/" + s.total : "");
+    if (s.state === "loading") {
+      return "Loading beaten games… " + s.loaded + (s.total ? "/" + s.total : "") +
+             (s.retrying ? " (no answer — retrying)" : "");
+    }
     if (s.state === "error") return "Sync failed (" + (s.error || "unknown error") + ") — try again";
     if (s.state === "done" && s.at) return s.loaded + " games synced · " + formatSyncTime(s.at);
     return "";
@@ -882,6 +1131,17 @@
 
   var flashTimer = null;
 
+  // Makes a failed sync noticeable even when the same message was already
+  // there: the red status texts blink once (footer and beside the Beaten label).
+  function flashSyncError() {
+    var els = document.querySelectorAll(".ra-sync-status.ra-sync-error, .ra-loading.ra-sync-error");
+    for (var i = 0; i < els.length; i++) {
+      els[i].classList.remove("ra-sync-blink");
+      void els[i].offsetWidth;            // restart the animation
+      els[i].classList.add("ra-sync-blink");
+    }
+  }
+
   // Keeps the footer Sync row and the little status hint next to the Beaten
   // label ("Loading… 100/208", then "Synced ✓" for a few seconds) in step with
   // the sync state.
@@ -894,16 +1154,20 @@
                            : "Open a RetroAchievements profile to sync";
     }
     var st = document.querySelector(".ra-sync-status");
-    if (st && st.textContent !== info.text) {
-      st.textContent = info.text;
-      fixFooterHeight(); // the text can wrap on narrow screens and make the footer taller
+    if (st) {
+      if (st.classList) st.classList.toggle("ra-sync-error", info.state === "error");
+      if (st.textContent !== info.text) {
+        st.textContent = info.text;
+        fixFooterHeight(); // the text can wrap on narrow screens and make the footer taller
+      }
     }
     var label = document.querySelector("#gameawards .ra-beaten-section .ra-grouplabel");
     if (label) {
       var hint = label.querySelector(".ra-loading");
       var text = "";
       if (beatenExtra.state === "loading") {
-        text = "Loading… " + beatenExtra.loaded + (beatenExtra.total ? "/" + beatenExtra.total : "");
+        text = "Loading… " + beatenExtra.loaded + (beatenExtra.total ? "/" + beatenExtra.total : "") +
+               (beatenExtra.retrying ? " (retrying)" : "");
       } else if (beatenExtra.state === "done" && Date.now() < beatenExtra.flashUntil) {
         text = "Synced " + beatenExtra.loaded + " games ✓";
         if (!flashTimer) {
@@ -920,6 +1184,7 @@
           label.insertBefore(hint, lbl ? lbl.nextSibling : label.firstChild);
         }
         if (hint.textContent !== text) hint.textContent = text;
+        hint.classList.toggle("ra-sync-error", beatenExtra.state === "error");
       } else if (hint && hint.parentNode) {
         hint.parentNode.removeChild(hint);
       }
@@ -1028,6 +1293,7 @@
     var a = document.createElement("a");
     a.className = "inline-block";
     a.href = "/game/" + game.gameId;
+    if (game.title) a.setAttribute("aria-label", game.title); // the badge image has no text
 
     var img = document.createElement("img");
     img.loading = "lazy";
@@ -1134,11 +1400,9 @@
   function buildRangeRow(rowClass, labelText, srText, min, max, step, value, onLive, onCommit) {
     var r = buildFooterRow(rowClass);
     r.label.textContent = labelText;
-    var sr = document.createElement("label");
-    sr.className = "sr-only";
-    sr.textContent = srText;
     var range = document.createElement("input");
     range.type = "range";
+    range.setAttribute("aria-label", srText);
     range.min = String(min);
     range.max = String(max);
     range.step = String(step);
@@ -1169,7 +1433,6 @@
       window.addEventListener("pointerup", release);
       window.addEventListener("pointercancel", release);
     });
-    r.controls.appendChild(sr);
     r.controls.appendChild(range);
     r.controls.appendChild(val);
     return r.row;
@@ -1179,13 +1442,11 @@
     var r = buildFooterRow(rowClass);
     r.label.textContent = labelText;
     r.row.title = "Arrange and hide beaten badges on your own profile";
-    var sr = document.createElement("label");
-    sr.className = "sr-only";
-    sr.textContent = srText;
     var wrap = document.createElement("label");
     wrap.className = "ra-switch";
     var input = document.createElement("input");
     input.type = "checkbox";
+    input.setAttribute("aria-label", srText);
     input.checked = !!checked;
     var slider = document.createElement("span");
     slider.className = "ra-switch-slider";
@@ -1229,7 +1490,6 @@
       input.checked = !input.checked;
       fireToggle(input.checked);
     }, { passive: false });
-    r.controls.appendChild(sr);
     r.controls.appendChild(wrap);
     return r;
   }
@@ -1537,11 +1797,9 @@
     // --- Beaten Sort row ---
     var sortRow = buildFooterRow("ra-footer-sort");
     sortRow.label.textContent = "Beaten Sort";
-    var sr = document.createElement("label");
-    sr.className = "sr-only";
-    sr.textContent = "Beaten sort order";
     var sel = document.createElement("select");
     sel.className = "ra-footer-sort-select";
+    sel.setAttribute("aria-label", "Beaten sort order");
     SORT_OPTIONS.forEach(function (o) {
       var op = document.createElement("option");
       op.value = o[0];
@@ -1551,12 +1809,17 @@
     sel.value = getSortPref();
     sel.addEventListener("change", function () {
       setSortPref(sel.value);
+      maybeQuickCheck();
       var ctx = buildContext();
-      if (ctx.manualActive) return; // manual order governs own profile
+      if (ctx.manualActive) {
+        // A saved arrangement governs the own profile; without one, Manual
+        // Order follows the Sort setting, so redraw.
+        refreshBeatenSection();
+        return;
+      }
       var grid = document.querySelector("#gameawards .ra-beaten-section .ra-beaten-grid");
       if (grid && !grid.classList.contains("ra-editing")) sortBeatenTiles(grid, sel.value);
     });
-    sortRow.controls.appendChild(sr);
     sortRow.controls.appendChild(sel);
 
     // --- Beaten Size row (50% – 100% of full size) ---
@@ -1581,6 +1844,7 @@
           cancelEditModeIfActive(); // toggling off discards an edit in progress
           setManualEnabled(on);
           refreshBeatenSection();
+          updateFooterEditButton();
         });
       // "Edit Badges" lives here, next to the switch. It is shown only when
       // the current page is the viewer's own profile with manual order on
@@ -1670,6 +1934,9 @@
     }
   }
 
+  function scrollX0() { return window.pageXOffset || 0; }
+  function scrollY0() { return window.pageYOffset || 0; }
+
   function positionGhostAt(x, y) {
     if (!dragState || !dragState.ghost) return;
     var w = (dragState.ghost.offsetWidth / 2) || 24;
@@ -1706,9 +1973,20 @@
       if (el.classList && el.classList.contains("ra-hidden")) continue;
       var r = null;
       try { r = el.getBoundingClientRect(); } catch (e) {}
-      if (r) dragState.rects.push({ el: el, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
+      if (r) dragState.rects.push({ el: el, cx: r.left + r.width / 2 + scrollX0(),
+                                    cy: r.top + r.height / 2 + scrollY0() });
     }
+    // The badge's own starting place has no tile in it, so it gets a target of
+    // its own — otherwise pointing at it would pick a neighbour and the badge
+    // could not be put back where it came from.
+    dragState.homeNext = slot.nextSibling;
+    var hr = null;
+    try { hr = slot.getBoundingClientRect(); } catch (e) {}
+    if (hr) dragState.rects.push({ home: true, cx: hr.left + hr.width / 2 + scrollX0(),
+                                   cy: hr.top + hr.height / 2 + scrollY0() });
+    dragState.topInset = stickyHeaderHeight();
     blockScroll(true);
+    startAutoScroll();
     // Appear at the pointer's current position (the badge "teleports"
     // under the pointer even if it moved away during the hold).
     positionGhostAt(dragState.lastX, dragState.lastY);
@@ -1722,17 +2000,26 @@
   function updateDropSlot(x, y) {
     var grid = dragState.grid, slot = dragState.slot;
     if (!grid || !slot || slot.parentNode !== grid) return;
+    // Pointer position → page coordinates (the cached tile centers are page
+    // coordinates too, so the page may scroll while a badge is being dragged).
+    x += scrollX0();
+    y += scrollY0();
     var rects = dragState.rects || [];
     var best = null, bestD = Infinity;
     for (var i = 0; i < rects.length; i++) {
-      if (rects[i].el.parentNode !== grid) continue;
+      if (!rects[i].home && rects[i].el.parentNode !== grid) continue;
       var dx = x - rects[i].cx, dy = y - rects[i].cy;
       var d = dx * dx + dy * dy;
       if (d < bestD) { bestD = d; best = rects[i]; }
     }
     if (!best) return;
-    var after = x > best.cx;
-    var ref = after ? best.el.nextSibling : best.el;
+    var ref;
+    if (best.home) {
+      ref = dragState.homeNext;                    // back to where it started
+      if (ref && ref.parentNode !== grid) ref = null;
+    } else {
+      ref = x > best.cx ? best.el.nextSibling : best.el;
+    }
     while (ref && ref !== slot && ref.classList && ref.classList.contains("ra-hidden")) {
       ref = ref.nextSibling;
     }
@@ -1756,7 +2043,48 @@
     }
   }
 
+  // While a badge is held near the top or bottom edge of the window, the page
+  // scrolls by itself so the badge can be carried across a long list. (Touch
+  // scrolling is blocked during a drag, so this is the only way there.)
+  var autoScrollRaf = null;
+  function autoScrollStep() {
+    autoScrollRaf = null;
+    if (!dragState || !dragState.active || !dragState.grid) return;
+    var EDGE = 70, MAX = 16, dy = 0;
+    var vh = window.innerHeight || 0;
+    var top = dragState.topInset || 0;
+    var y = dragState.lastY;
+    var gr = null;
+    try { gr = dragState.grid.getBoundingClientRect(); } catch (e) {}
+    if (gr && vh > 0) {
+      // Only while the badge list actually continues beyond that edge.
+      if (y < top + EDGE && gr.top < top + 8) {
+        dy = -Math.ceil(MAX * Math.min(1, (top + EDGE - y) / EDGE));
+      } else if (y > vh - EDGE && gr.bottom > vh - 8) {
+        dy = Math.ceil(MAX * Math.min(1, (y - (vh - EDGE)) / EDGE));
+      }
+    }
+    if (dy) {
+      try { window.scrollBy({ top: dy, left: 0, behavior: "instant" }); }
+      catch (e) { window.scrollBy(0, dy); }
+      updateDropSlot(dragState.lastX, dragState.lastY);
+    }
+    autoScrollRaf = window.requestAnimationFrame(autoScrollStep);
+  }
+  function startAutoScroll() {
+    if (!autoScrollRaf && typeof window.requestAnimationFrame === "function") {
+      autoScrollRaf = window.requestAnimationFrame(autoScrollStep);
+    }
+  }
+  function stopAutoScroll() {
+    if (autoScrollRaf) {
+      try { window.cancelAnimationFrame(autoScrollRaf); } catch (e) {}
+      autoScrollRaf = null;
+    }
+  }
+
   function cleanupDrag() {
+    stopAutoScroll();
     if (dragState) {
       if (dragState.ghost && dragState.ghost.parentNode) {
         dragState.ghost.parentNode.removeChild(dragState.ghost);
@@ -1796,6 +2124,10 @@
       positionGhostAt(dragState.lastX, dragState.lastY);
       updateDropSlot(dragState.lastX, dragState.lastY);
     }, { passive: false });
+    // The page moved under a held badge (mouse wheel, keyboard): re-aim.
+    window.addEventListener("scroll", function () {
+      if (dragState && dragState.active) updateDropSlot(dragState.lastX, dragState.lastY);
+    }, { passive: true });
     document.addEventListener("pointerup", function () { if (dragState) endGesture(); });
     document.addEventListener("pointercancel", function () { if (dragState) endGesture(); });
   }
@@ -2025,10 +2357,8 @@
     visible.forEach(function (g) { bGrid.appendChild(makeBeatenTile(g, ctx.username)); });
     section.appendChild(bGrid);
 
-    if (visible.length >= 2 && !ctx.manualActive) {
-      sortBeatenTiles(bGrid, getSortPref());
-    }
-
+    // No sorting here: getAllBeaten() already delivers the games in the order
+    // of the Sort setting (and applyManualOrder keeps a saved arrangement).
     return section;
   }
 
